@@ -2,6 +2,10 @@
 
 使用 Python / PySide6（Qt Widgets）编写的中文桌面 rsync 客户端。批量选择文件和目录，导出到同一个本地目录，或通过 SSH 上传、下载。
 
+# 软件截图
+
+![rsync desk](./images/20261106-103054.jpg)
+
 ## 启动
 
 需要 Python 3.10+、PySide6-Essentials、rsync 3.1+。远端同步还需要 OpenSSH 客户端和远端安装 rsync。
