@@ -1,0 +1,8 @@
+FROM ubuntu:20.04
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    rsync openssh-client libgl1 libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+    libfontconfig1 libdbus-1-3 xvfb xauth fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /release
+RUN apt-get update && apt-get install -y --no-install-recommends libglib2.0-0 libxcb-randr0 libxcb-icccm4 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-sync1 libxcb-xkb1 libx11-xcb1 && rm -rf /var/lib/apt/lists/*

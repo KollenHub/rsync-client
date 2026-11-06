@@ -1,0 +1,11 @@
+# Compatible manylinux wheels for Ubuntu 20.04 / glibc 2.31.
+PySide6-Essentials==6.8.3
+shiboken6==6.8.3
+cryptography==44.0.3
+paramiko==5.1.0
+bcrypt==4.3.0
+PyNaCl==1.6.2
+cffi==2.0.0
+Nuitka==4.3.4
+ordered-set==4.1.0
+patchelf==0.17.2.2

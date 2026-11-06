@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>Rsync Desk</title>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8976f5"/>
+      <stop offset="1" stop-color="#5140b8"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#background)"/>
+  <g fill="none" stroke="#fff" stroke-width="34" stroke-linecap="round">
+    <path d="M 144 228 C 158 173 201 140 253 140 C 291 140 323 157 346 189"/>
+    <path d="M 144 228 C 158 173 201 140 253 140 C 291 140 323 157 346 189" transform="rotate(180 256 256)"/>
+  </g>
+  <g fill="#fff">
+    <path d="M 366 132 L 366 222 L 276 222 Z"/>
+    <path d="M 366 132 L 366 222 L 276 222 Z" transform="rotate(180 256 256)"/>
+  </g>
+</svg>
