@@ -146,6 +146,26 @@ class TransferTests(unittest.TestCase):
         self.assertNotIn("secret-123", logs)
         self.assertIn("******", logs)
 
+    def test_sync_contents_mode_copies_directory_contents(self):
+        folder = self.root / "相册"
+        (folder / "nested").mkdir(parents=True)
+        (folder / "数据.bin").write_bytes(os.urandom(50_000))
+        (folder / "nested" / "deep.txt").write_text("内容")
+        spec = TaskSpec("内容直传", str(folder), str(self.root / "out"), sync_contents=True)
+        command = build_command(spec)
+        self.assertEqual(command[-2], str(folder) + "/")
+        self.assertEqual(command[-1], str(self.root / "out") + "/")
+        key = self.manager.add(spec)
+        self.manager.start([key])
+        result = self.wait_for(key, {"success", "failed"})
+        self.assertEqual(result.status, "success", result.error)
+        self.assertTrue((self.root / "out" / "数据.bin").exists())
+        self.assertTrue((self.root / "out" / "nested" / "deep.txt").exists())
+        self.assertFalse((self.root / "out" / folder.name).exists())
+        # Without the option the directory itself is created inside the destination.
+        plain = build_command(TaskSpec("普通", str(folder), str(self.root / "out")))
+        self.assertEqual(plain[-2], str(folder))
+
     def test_missing_rsync_and_atomic_input_validation(self):
         source = self.root / "source"
         source.touch()
@@ -173,6 +193,48 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(command[-1], "[2001:db8::1]:/backup/空 格/")
         self.assertEqual(command[-2], "/tmp/name ; $(command)")
 
+    def test_remote_internal_command_runs_rsync_on_the_server(self):
+        spec = TaskSpec("remote", "/srv/数据 ; 目录", "/srv/backup", direction="remote",
+                        host="203.0.113.7", username="test", port=2222, password="secret", excludes=("*.tmp",))
+        spec.validate(check_paths=False)
+        command = build_command(spec)
+        self.assertNotIn("secret", shlex.join(command))
+        self.assertEqual(command[0], "ssh")
+        self.assertEqual(command[command.index("-p") + 1], "2222")
+        self.assertEqual(command[command.index("-l") + 1], "test")
+        self.assertEqual(command[command.index("--") + 1], "203.0.113.7")
+        wrapper = command[-1]
+        self.assertTrue(wrapper.startswith("echo RSYNC_PID=$$; exec rsync"))
+        remote_rsync = shlex.split(wrapper.split("; exec ", 1)[1])
+        self.assertEqual(remote_rsync[0], "rsync")
+        self.assertIn("-z", remote_rsync)
+        self.assertEqual(remote_rsync[-2:], ["/srv/数据 ; 目录", "/srv/backup/"])
+        contents = build_command(replace(spec, sync_contents=True))
+        self.assertIn(repr("/srv/数据 ; 目录/"), contents[-1])  # trailing slash: copy contents
+
+    def test_stage_error_exit_code_hints(self):
+        remote = TaskSpec("r", "/a", "/b", direction="remote", host="s", username="u")
+        self.assertIn("未安装 rsync", TaskManager._stage_error(remote, 127, scanning=True))
+        self.assertNotIn("未安装", TaskManager._stage_error(remote, 23, scanning=True))
+        upload = TaskSpec("u", "/tmp/x", "/b", direction="upload", host="s", username="u")
+        self.assertIn("退出码 12", TaskManager._stage_error(upload, 12, scanning=False))
+        self.assertIn("可能是远端服务器未安装", TaskManager._stage_error(upload, 12, scanning=False))
+
+    def test_sync_contents_rejects_same_or_nested_destination(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "data"
+            source.mkdir()
+            for destination in (source, source / "nested"):
+                with self.subTest(destination=destination), self.assertRaises(ValueError):
+                    TaskSpec("bad", str(source), str(destination), sync_contents=True).validate()
+            TaskSpec("ok", str(source), str(Path(td) / "out"), sync_contents=True).validate()
+        with self.assertRaises(ValueError):
+            TaskSpec("remote", "/srv/data", "/srv/data", direction="remote",
+                     host="s", username="u", sync_contents=True).validate(check_paths=False)
+        with self.assertRaises(ValueError):
+            TaskSpec("remote", "/srv/data", "/srv/data/sub", direction="remote",
+                     host="s", username="u", sync_contents=True).validate(check_paths=False)
+
     def test_reject_overlapping_local_paths(self):
         with tempfile.TemporaryDirectory() as td:
             source = Path(td) / "source"
@@ -180,6 +242,18 @@ class CommandTests(unittest.TestCase):
             for destination in (source, source / "nested", source.parent):
                 with self.subTest(destination=destination), self.assertRaises(ValueError):
                     TaskSpec("bad", str(source), str(destination)).validate()
+
+    def test_remote_internal_paths_must_be_absolute_and_non_overlapping(self):
+        args = {"direction": "remote", "host": "server.example", "username": "alice"}
+        with self.assertRaises(ValueError):
+            TaskSpec("relative", "data", "/srv/backup", **args).validate(check_paths=False)
+        with self.assertRaises(ValueError):
+            TaskSpec("relative", "/srv/data", "backup", **args).validate(check_paths=False)
+        for source, destination in (("/srv/data", "/srv/data"), ("/srv/data", "/srv/data/backup"),
+                                    ("/srv/data", "/srv"), ("/", "/srv")):
+            with self.subTest(destination=destination), self.assertRaises(ValueError):
+                TaskSpec("overlap", source, destination, **args).validate(check_paths=False)
+        TaskSpec("valid", "/srv/data", "/srv/backup", **args).validate(check_paths=False)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ def migrate_connections(specs: list[TaskSpec]) -> tuple[list[TaskSpec], list[Ser
     return migrated, list(profiles.values())
 
 
-DIRECTIONS = ("upload", "download", "local")
+DIRECTIONS = ("upload", "download", "local", "remote")
 
 
 def sanitize_last_directories(raw) -> dict[str, dict[str, dict[str, str]]]:

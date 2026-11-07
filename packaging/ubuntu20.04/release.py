@@ -14,8 +14,8 @@ from pathlib import Path
 ROOT = Path('/work')
 BUILD = ROOT / 'build' / 'ubuntu20.04'
 DIST = ROOT / 'dist'
-NAME = 'rsync-desk-1.0.0-ubuntu20.04-x86_64'
-DEB_VERSION = '1.0.0-3ubuntu20.04'
+NAME = 'rsync-desk-1.0.1-ubuntu20.04-x86_64'
+DEB_VERSION = '1.0.1-1ubuntu20.04'
 ICON_SIZES = (16, 24, 32, 48, 64, 128, 256, 512)
 
 
@@ -90,7 +90,7 @@ def run():
     launcher.write_text('#!/bin/sh\nset -eu\napp_root=$(CDPATH= cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)\nexport QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"\nexec "$app_root/app/rsync-desk" "$@"\n')
     launcher.chmod(0o755)
     (staging / 'README.txt').write_text(
-        'Rsync Desk 1.0.0 — Ubuntu 20.04 x86_64\n\n'
+        'Rsync Desk 1.0.1 — Ubuntu 20.04 x86_64\n\n'
         '便携版：完整解压后执行 ./rsync-desk，不需要安装 Python。不要单独移动 app 内的可执行文件。\n'
         '系统依赖：sudo apt install rsync openssh-client libgl1 libegl1 libglib2.0-0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-randr0 libxcb-icccm4 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-sync1 libxcb-xkb1 libx11-xcb1 libfontconfig1 libdbus-1-3\n'
         '中文字体建议：sudo apt install fonts-noto-cjk\n'

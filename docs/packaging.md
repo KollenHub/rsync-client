@@ -16,8 +16,8 @@ Qt 使用 `PySide6-Essentials 6.8.3` 的 manylinux_2_28 wheel，兼容 glibc 2.3
 
 产物位于 `dist/`：
 
-- `rsync-desk_1.0.0-3ubuntu20.04_amd64.deb`：安装包，依赖由 apt 处理。
-- `rsync-desk-1.0.0-ubuntu20.04-x86_64.tar.gz`：便携目录压缩包，完整解压后运行 `rsync-desk`。
+- `rsync-desk_1.0.1-1ubuntu20.04_amd64.deb`：安装包，依赖由 apt 处理。
+- `rsync-desk-1.0.1-ubuntu20.04-x86_64.tar.gz`：便携目录压缩包，完整解压后运行 `rsync-desk`。
 - 同名 `build-info.json`：构建版本、Qt 模块/插件、glibc 审计和冒烟测试结果。
 - `SHA256SUMS`：安装包与压缩包校验值。
 
@@ -26,7 +26,7 @@ Python 和应用依赖包含在发布目录内，运行时不需要 Python。rsy
 ## 安装与使用
 
 ```bash
-sudo apt install ./rsync-desk_1.0.0-3ubuntu20.04_amd64.deb
+sudo apt install ./rsync-desk_1.0.1-1ubuntu20.04_amd64.deb
 rsync-desk
 ```
 
@@ -34,8 +34,8 @@ rsync-desk
 
 ```bash
 sudo apt install rsync openssh-client libgl1 libegl1 libglib2.0-0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-randr0 libxcb-icccm4 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-sync1 libxcb-xkb1 libx11-xcb1 libfontconfig1 libdbus-1-3 fonts-noto-cjk
-tar -xzf rsync-desk-1.0.0-ubuntu20.04-x86_64.tar.gz
-cd rsync-desk-1.0.0-ubuntu20.04-x86_64
+tar -xzf rsync-desk-1.0.1-ubuntu20.04-x86_64.tar.gz
+cd rsync-desk-1.0.1-ubuntu20.04-x86_64
 ./rsync-desk
 ```
 

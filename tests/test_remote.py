@@ -79,6 +79,89 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual((self.root / "download" / source.name).read_bytes(), content)
         self.assertEqual(self.fixture.authenticated, 4)  # scan and transfer, for both directions
 
+    def test_remote_internal_sync_runs_rsync_on_the_server(self):
+        source = self.root / "远端 源 ; 目录"
+        (source / "nested").mkdir(parents=True)
+        content = os.urandom(150_000)
+        (source / "文件.bin").write_bytes(content)
+        (source / "nested" / "deep.txt").write_text("内容")
+        (source / "ignored.tmp").write_text("excluded")
+        args = {"host": "127.0.0.1", "username": "alice", "port": self.port, "password": self.password}
+        destination = self.root / "新建 备份" / "嵌套"  # created by the client on the server
+        result = self.transfer(TaskSpec("远端互同步", str(source), str(destination), direction="remote",
+                                        excludes=("*.tmp",), **args))
+        logs = "\n".join(t for _, t in self.manager.logs_since(result.id, 0))
+        self.assertEqual(result.status, "success", logs)
+        self.assertNotIn(self.password, logs)
+        self.assertIn("rsync", logs)
+        self.assertIn("mkdir", logs)
+        self.assertEqual((destination / source.name / "文件.bin").read_bytes(), content)
+        self.assertEqual((destination / source.name / "nested" / "deep.txt").read_text(), "内容")
+        self.assertFalse((destination / source.name / "ignored.tmp").exists())
+        # Three SSH sessions: destination creation, then scan and transfer on the server.
+        self.assertEqual(self.fixture.authenticated, 3)
+
+    def test_missing_remote_rsync_fails_with_explicit_hint(self):
+        self.fixture.hide_rsync = True
+        source = self.root / "source"
+        source.write_text("data")
+        args = {"host": "127.0.0.1", "username": "alice", "port": self.port, "password": self.password}
+        result = self.transfer(TaskSpec("远端互同步", str(source), str(self.root / "dest"), direction="remote", **args))
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.return_code, 127)
+        self.assertIn("未安装 rsync", result.error)
+        logs = "\n".join(t for _, t in self.manager.logs_since(result.id, 0))
+        self.assertIn("not found", logs)
+        self.assertFalse((self.root / "dest" / "source").exists())
+
+    def test_remote_internal_sync_contents_mode(self):
+        source = self.root / "源 目录"
+        (source / "nested").mkdir(parents=True)
+        (source / "文件.bin").write_bytes(os.urandom(60_000))
+        (source / "nested" / "deep.txt").write_text("内容")
+        args = {"host": "127.0.0.1", "username": "alice", "port": self.port, "password": self.password}
+        destination = self.root / "备份"
+        destination.mkdir()
+        result = self.transfer(TaskSpec("内容直传", str(source), str(destination), direction="remote",
+                                        sync_contents=True, **args))
+        self.assertEqual(result.status, "success", result.error)
+        self.assertTrue((destination / "文件.bin").exists())
+        self.assertTrue((destination / "nested" / "deep.txt").exists())
+        self.assertFalse((destination / source.name).exists())
+
+    def test_remote_internal_cancel_stops_server_side_rsync(self):
+        source = self.root / "大数据.bin"
+        source.write_bytes(os.urandom(4 * 1024 * 1024))
+        args = {"host": "127.0.0.1", "username": "alice", "port": self.port, "password": self.password,
+                "bandwidth_kib": 64}
+        destination = self.root / "dest"
+        destination.mkdir()
+        key = self.manager.add(TaskSpec("可取消", str(source), str(destination), direction="remote", **args))
+        self.manager.start([key])
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and self.manager.get(key).status != "running":
+            time.sleep(0.03)
+        self.assertEqual(self.manager.get(key).status, "running")
+        self.manager.stop([key])
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and self.manager.get(key).status != "cancelled":
+            time.sleep(0.03)
+        self.assertEqual(self.manager.get(key).status, "cancelled")
+        # The rsync running on the (simulated) server must actually exit.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            running = [p for p in self.fixture.processes
+                       if source.name in (p.args[1] if p.args else "") and p.poll() is None]
+            if not running:
+                break
+            time.sleep(0.1)
+        running = [p for p in self.fixture.processes
+                   if source.name in (p.args[1] if p.args else "") and p.poll() is None]
+        self.assertEqual(running, [], "server-side rsync still running after cancel")
+        logs = "\n".join(t for _, t in self.manager.logs_since(key, 0))
+        self.assertIn("RSYNC_PID=", logs)
+        self.assertIn("已请求服务器停止 rsync 进程", logs)
+
     def test_wrong_password_is_reported_as_failure(self):
         source = self.root / "source"
         source.touch()

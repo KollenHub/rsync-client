@@ -15,4 +15,4 @@ python3.11 -m nuitka main.py \
     --assume-yes-for-downloads --jobs=4
 python3.11 packaging/ubuntu20.04/release.py
 PYTHONPATH=/work python3.11 packaging/ubuntu20.04/smoke_ssh.py \
-    /work/build/ubuntu20.04/rsync-desk-1.0.0-ubuntu20.04-x86_64/app/rsync-desk
+    /work/build/ubuntu20.04/rsync-desk-1.0.1-ubuntu20.04-x86_64/app/rsync-desk

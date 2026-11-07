@@ -242,8 +242,8 @@ class TaskDialog(Modal):
         self.resize(980, 780)
         self.setMinimumSize(820, 660)
         spec = editing.spec if editing else None
-        self._source = spec.server_id if spec and spec.direction == 'download' else ''
-        self._target = spec.server_id if spec and spec.direction == 'upload' else ''
+        self._source = spec.server_id if spec and spec.direction in ('download', 'remote') else ''
+        self._target = spec.server_id if spec and spec.direction in ('upload', 'remote') else ''
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         heading = QHBoxLayout()
@@ -282,9 +282,13 @@ class TaskDialog(Modal):
         layout.addLayout(row(self.name, label('限速 KiB/s（0 不限）'), self.bandwidth))
         self.compression = QCheckBox('远端压缩')
         self.compression.setChecked(spec.compression if spec else True)
+        self.contents = QCheckBox('内容直传：把源目录的内容直接同步到目标目录，不再套一层源目录')
+        self.contents.setChecked(spec.sync_contents if spec else False)
+        self.contents.toggled.connect(lambda _: self.refresh_sources())
         self.excludes = QLineEdit(';'.join(spec.excludes) if spec else '')
         self.excludes.setPlaceholderText('排除规则，使用 ; 分隔，例如 .git;*.tmp')
-        layout.addLayout(row(self.compression, self.excludes))
+        layout.addLayout(row(self.compression, self.contents))
+        layout.addLayout(row(self.excludes))
         actions = QHBoxLayout()
         actions.addWidget(button('预览传输命令', self.preview))
         actions.addStretch()
@@ -302,7 +306,9 @@ class TaskDialog(Modal):
         """Pre-fill the destination with the remembered directory for this server and direction."""
         source = self._source if source is None else source
         target = self._target if target is None else target
-        if source:  # download: destination is a local directory
+        if source and source == target:  # remote internal sync: destination lives on the server
+            path = self.app.last_directory_for(source, 'remote') or self.app.servers[source].initial_directory
+        elif source:  # download: destination is a local directory
             path = self.app.last_directory_for(source, 'download')
         elif target:  # upload: destination is a remote directory
             path = self.app.last_directory_for(target, 'upload') or self.app.servers[target].initial_directory
@@ -328,22 +334,29 @@ class TaskDialog(Modal):
         self.update_route()
 
     def update_route(self):
-        if self._source:
-            self._target = ''
+        if self._source and self._target and self._source != self._target:
+            self._target = ''  # transfers between two different servers are not supported yet
         self.target_endpoint.blockSignals(True)
         self.target_endpoint.clear()
         self.target_endpoint.addItem('本机', '')
-        if not self._source:
-            for profile in self.app.servers.values():
+        for profile in self.app.servers.values():
+            # With a remote source only the same server (remote internal sync) is offered.
+            if not self._source or profile.id == self._source:
                 self.target_endpoint.addItem(profile.name, profile.id)
         self.target_endpoint.setCurrentIndex(max(0, self.target_endpoint.findData(self._target)))
         self.target_endpoint.blockSignals(False)
+        if self._source and self._source == self._target:
+            route = connection_route(self.app.servers[self._source], self.app.servers)
+            self.route_hint.setText(
+                f'远端内部同步：rsync 直接在服务器上执行，数据不经本机中转。\n'
+                f'连接路径：本机 → {" → ".join(profile.name for profile in route)}')
+            return
         server_id = self._source or self._target
         if server_id:
             route = connection_route(self.app.servers[server_id], self.app.servers)
             self.route_hint.setText(f'连接路径：本机 → {" → ".join(profile.name for profile in route)}')
         else:
-            self.route_hint.setText('本机目录之间导出；选择已保存的服务器即可上传或下载。')
+            self.route_hint.setText('本机目录之间同步；选择已保存的服务器即可上传或下载，两端选同一台服务器则在其内部同步。')
 
     def endpoints_changed(self, source_changed):
         source, target = self.source_endpoint.currentData(), self.target_endpoint.currentData()
@@ -365,7 +378,9 @@ class TaskDialog(Modal):
     def refresh_sources(self):
         self.source_list.clear()
         self.source_list.addItems(self.sources)
-        self.source_count.setText(f'{len(self.sources)} 项 · 每个文件或目录独立生成一条任务，保留目录名称')
+        mode = '内容直传：源目录的内容直接写入目标目录' if self.contents.isChecked() else \
+            '每个文件或目录独立生成一条任务，保留目录名称'
+        self.source_count.setText(f'{len(self.sources)} 项 · {mode}')
 
     def add_paths(self, paths):
         for path in paths:
@@ -380,8 +395,9 @@ class TaskDialog(Modal):
         self.refresh_sources()
 
     def pick_sources(self):
-        if self._source:  # download: sources live on the remote server
-            initial = self.app.last_directory_for(self._source, 'download', 'source')
+        if self._source:  # download / remote internal: sources live on the remote server
+            direction = 'remote' if self._source == self._target else 'download'
+            initial = self.app.last_directory_for(self._source, direction, 'source')
             picker = RemotePicker(self, self.app, self._source, self.add_paths, initial=initial)
         else:  # upload / local: sources live on this machine
             direction = 'upload' if self._target else 'local'
@@ -391,7 +407,8 @@ class TaskDialog(Modal):
 
     def choose_destination(self):
         if self._target:
-            initial = self.app.last_directory_for(self._target, 'upload')
+            direction = 'remote' if self._source == self._target else 'upload'
+            initial = self.app.last_directory_for(self._target, direction)
             return self.app.show_dialog(RemotePicker(self, self.app, self._target, self.destination.setText,
                                                      directory_only=True, initial=initial))
         direction = 'download' if self._source else 'local'
@@ -419,14 +436,15 @@ class TaskDialog(Modal):
     def build_specs(self):
         if not self.sources or not self.destination.text().strip():
             raise ValueError('请选择源文件 / 目录，并指定目标目录')
-        if self._source and self._target:
-            raise ValueError('请选择本机与远端之间的传输')
+        if self._source and self._target and self._source != self._target:
+            raise ValueError('暂不支持两台不同服务器之间直接同步；请在本机中转，或两端选择同一台服务器')
         if self.editing and len(self.sources) != 1:
             raise ValueError('编辑单条任务时请保留一个源路径；批量传输请新建')
         names = [PurePosixPath(path).name for path in self.sources]
-        if len(names) != len(set(names)):
-            raise ValueError('同名文件或目录会写入同一目标，请拆分到不同目标目录')
-        direction = 'download' if self._source else 'upload' if self._target else 'local'
+        if len(names) != len(set(names)) and not self.contents.isChecked():
+            raise ValueError('同名文件或目录会写入同一目标，请拆分到不同目标目录，或勾选内容直传合并')
+        direction = 'remote' if self._source and self._source == self._target else \
+            'download' if self._source else 'upload' if self._target else 'local'
         profile = self.app.servers.get(self._source or self._target)
         specs = []
         for path in self.sources:
@@ -436,6 +454,7 @@ class TaskDialog(Modal):
                             source=path if self._source else local_path(path),
                             destination=self.destination.text().strip() if self._target else local_path(self.destination.text().strip()),
                             direction=direction, compression=self.compression.isChecked(), bandwidth_kib=self.bandwidth.value(),
+                            sync_contents=self.contents.isChecked(),
                             excludes=tuple(rule.strip() for rule in self.excludes.text().split(';') if rule.strip()))
             if profile:
                 spec = replace(profile.bind(spec), jump_hosts=connection_route(profile, self.app.servers)[:-1])
@@ -459,7 +478,7 @@ class TaskDialog(Modal):
                 for spec in specs:
                     self.app.manager.add(spec)
             direction = specs[0].direction
-            server_id = self._source if direction == 'download' else self._target if direction == 'upload' else ''
+            server_id = self._source if direction in ('download', 'remote') else self._target if direction == 'upload' else ''
             source_hint = str(PurePosixPath(self.sources[-1]).parent) if self.sources else ''
             self.app.remember_directories(server_id, direction, source=source_hint, destination=self.destination.text())
             self.app.persist()

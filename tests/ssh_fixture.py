@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-import shlex
+import re
 import socket
 import subprocess
 import threading
@@ -15,6 +15,7 @@ import paramiko
 class SSHFixture:
     def __init__(self, root: Path, username="alice", password="s3cret-测试"):
         self.root, self.username, self.password = root, username, password
+        self.hide_rsync = False  # simulate a server without rsync installed
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.port = self.listener.getsockname()[1]
@@ -146,12 +147,12 @@ class SSHFixture:
             thread.join(timeout=2)
 
     def _exec(self, channel, command):
-        arguments = shlex.split(command)
-        if not arguments or arguments[0] != "rsync":
-            channel.send_exit_status(127)
-            channel.close()
-            return
-        process = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if self.hide_rsync:  # simulate a server where rsync is not installed
+            command = re.sub(r"\brsync\b", "rsync-missing", command)
+        # A real sshd hands the command to the user's login shell, which makes
+        # `echo RSYNC_PID=$$; exec rsync ...` wrappers and shell builtins (kill) work.
+        process = subprocess.Popen(["/bin/sh", "-c", command], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.processes.append(process)
 
         def incoming():

@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .config import default_config_path, load_config, load_task_states, save_config
 from .engine import TaskManager, summarize
 from .models import ACTIVE, STATUS_LABELS, ServerProfile, connection_route, format_bytes
@@ -41,7 +42,7 @@ from .vault import Vault
 
 
 class TaskModel(QAbstractTableModel):
-    HEADERS = ('文件 / 目录', '传输方向', '目标目录', '状态', '进度', '已处理 / 待更新', '速度')
+    HEADERS = ('文件 / 目录', '传输方向', '目标目录', '状态', '进度', '已处理 / 待更新', '速度', '剩余时间')
 
     def __init__(self, app):
         super().__init__(app)
@@ -75,11 +76,15 @@ class TaskModel(QAbstractTableModel):
             return None
         profile = self.app.servers.get(task.spec.server_id)
         server = profile.name if profile else task.spec.host
-        direction = f'{server} → 本机' if task.spec.direction == 'download' else f'本机 → {server}' if task.spec.direction == 'upload' else '本机 → 本机'
+        direction = (f'{server} → {server}' if task.spec.direction == 'remote' else
+                     f'{server} → 本机' if task.spec.direction == 'download' else
+                     f'本机 → {server}' if task.spec.direction == 'upload' else '本机 → 本机')
         total = format_bytes(task.total_bytes) if task.total_bytes is not None else '—'
         progress = '正在扫描…' if task.status == 'scanning' else '等待扫描' if task.status in {'ready', 'queued'} else f'{task.percent:.1f}%'
         values = (task.spec.name, direction, task.spec.destination, STATUS_LABELS[task.status], progress,
-                  f'{format_bytes(task.transferred_bytes)} / {total}', f'{format_bytes(task.speed)}/s' if task.status == 'running' else '—')
+                  f'{format_bytes(task.transferred_bytes)} / {total}',
+                  f'{format_bytes(task.speed)}/s' if task.status == 'running' else '—',
+                  task.eta if task.status == 'running' else '—')
         return values[index.column()]
 
     def update_tasks(self, snapshots):
@@ -90,7 +95,7 @@ class TaskModel(QAbstractTableModel):
         elif snapshots != self.tasks:
             self.tasks = snapshots
             if snapshots:
-                self.dataChanged.emit(self.index(0, 0), self.index(len(snapshots) - 1, 6))
+                self.dataChanged.emit(self.index(0, 0), self.index(len(snapshots) - 1, self.columnCount() - 1))
 
 
 class ProgressDelegate(QStyledItemDelegate):
@@ -176,7 +181,7 @@ class DetailWindow(Modal):
 class App(QMainWindow):
     def __init__(self, config_path: Path | None = None):
         super().__init__()
-        self.setWindowTitle('Rsync Desk · 文件同步客户端')
+        self.setWindowTitle(f'Rsync Desk {__version__} · 文件同步客户端')
         self.resize(1320, 860)
         self.setMinimumSize(1080, 720)
         self.config_path = config_path or default_config_path()
@@ -302,7 +307,7 @@ class App(QMainWindow):
         self.table.verticalHeader().setDefaultSectionSize(46)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
-        for n, width in enumerate((195, 170, 230, 100, 145, 180, 90)):
+        for n, width in enumerate((195, 170, 230, 100, 145, 180, 90, 90)):
             self.table.setColumnWidth(n, width)
         self.table.setItemDelegateForColumn(4, ProgressDelegate(self.table))
         self.table.doubleClicked.connect(self.open_details)
@@ -417,17 +422,28 @@ class App(QMainWindow):
         for index, (status, title) in enumerate(STATUS_TABS):
             count = len(tasks) if status == 'all' else sum(task_group(task.status) == status for task in tasks)
             self.status_tabs.setTabText(index, f'{title} ({count})')
-        summary = summarize(tasks)
+        # The overall bar tracks only this batch (queued/scanning/running/cancelling),
+        # not the whole history list, so it reflects "this run" progress.
+        active = [task for task in tasks if task.status in ACTIVE]
+        summary = summarize(active)
+        queued = sum(task.status == 'queued' for task in tasks)
         for widget, value in zip(self.metric_labels, (len(snapshots), counts['upload'], counts['download'], sum(task.status == 'failed' for task in snapshots))):
             widget.setText(str(value))
-        title = dict(DIRECTION_TABS)[self.current_direction()].replace('↑ ', '').replace('↓ ', '')
+        title = dict(DIRECTION_TABS)[self.current_direction()].replace('↑ ', '').replace('↓ ', '').replace('⇄ ', '')
         self.progress_title.setText(f'{title}总体进度')
-        self.overall_bar.setValue(int(summary.percent * 10))
-        self.overall_label.setText(f'{summary.percent:.1f}%   ·   已完成 {summary.complete} / {summary.total}')
-        pending = f'   ·   {summary.unknown} 项尚未扫描，当前为已知数据估计' if summary.unknown else ''
-        queued = sum(task.status == 'queued' for task in tasks)
-        self.overall_info.setText(f'{counts[self.current_direction()]} 个运行中 · {queued} 个排队   ·   {format_bytes(summary.transferred_bytes)} / {format_bytes(summary.total_bytes)}'
-                                  f'   ·   合计速度 {format_bytes(summary.speed)}/s{pending}')
+        if active:
+            self.overall_bar.setValue(int(summary.percent * 10))
+            self.overall_label.setText(f'{summary.percent:.1f}%   ·   运行中 {counts[self.current_direction()]} · 排队 {queued}')
+            pending = f'   ·   {summary.unknown} 项尚未扫描，当前为已知数据估计' if summary.unknown else ''
+            if summary.total:
+                self.overall_info.setText(f'{counts[self.current_direction()]} 个运行中 · {queued} 个排队   ·   {format_bytes(summary.transferred_bytes)} / {format_bytes(summary.total_bytes)}'
+                                          f'   ·   合计速度 {format_bytes(summary.speed)}/s{pending}')
+            else:
+                self.overall_info.setText(f'{counts[self.current_direction()]} 个运行中 · {queued} 个排队   ·   正在预扫描，稍后显示数据量')
+        else:
+            self.overall_bar.setValue(0)
+            self.overall_label.setText('空闲   ·   运行中 0 · 排队 0')
+            self.overall_info.setText('当前没有运行中的任务；总体进度只统计本次运行的任务。')
         visible = self.visible_tasks()
         self.retry_button.setEnabled(any(task.status == 'failed' for task in visible))
         self.clear_button.setEnabled(any(task.status not in ACTIVE for task in visible))
@@ -505,10 +521,10 @@ class App(QMainWindow):
     def start(self, ids):
         try:
             resolved = {}
-            for task_id in ids:
+            candidates = [task_id for task_id in ids
+                          if (task := self.manager.get(task_id)) and task.status not in ACTIVE]
+            for task_id in candidates:
                 task = self.manager.get(task_id)
-                if not task or task.status in ACTIVE:
-                    continue
                 if task.spec.server_id:
                     server_id = task.spec.server_id
                     if server_id not in resolved:
@@ -518,7 +534,9 @@ class App(QMainWindow):
                         resolved[server_id] = route
                     route = resolved[server_id]
                     self.manager.update(task_id, replace(route[-1].bind(task.spec), jump_hosts=route[:-1]))
-            self.manager.start(ids)
+            self.manager.start(candidates)
+            if candidates:
+                self.show_tasks(self.current_direction(), 'running')
         except (ValueError, OSError) as exc:
             QMessageBox.critical(self, '无法启动任务', str(exc))
 
@@ -534,9 +552,7 @@ class App(QMainWindow):
     def retry_failed(self):
         ids = [task.id for task in self.visible_tasks() if task.status == 'failed']
         if ids:
-            direction = self.current_direction()
-            self.start(ids)
-            self.show_tasks(direction)
+            self.start(ids)  # start() switches to the running tab
 
     def clear_current(self):
         visible = self.visible_tasks()

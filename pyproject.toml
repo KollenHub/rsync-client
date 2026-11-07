@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rsync-desk"
-version = "1.0.0"
+version = "1.0.1"
 description = "Python desktop rsync client with batch transfers, progress and encrypted credentials"
 requires-python = ">=3.10"
 dependencies = ["cryptography>=43,<48", "paramiko>=3.5,<6", "PySide6-Essentials>=6.8,<7"]

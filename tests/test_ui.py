@@ -65,8 +65,8 @@ class GuiTests(unittest.TestCase):
     def add_transfer(self, direction, name, status='ready'):
         source = self.root / f'{name}.bin'
         source.write_bytes(b'data')
-        spec = TaskSpec(name, '/remote/' + name if direction == 'download' else str(source),
-                        '/remote/output' if direction == 'upload' else str(self.root / 'out'),
+        spec = TaskSpec(name, '/remote/' + name if direction in ('download', 'remote') else str(source),
+                        '/remote/output' if direction in ('upload', 'remote') else str(self.root / 'out'),
                         direction=direction, host='example.org' if direction != 'local' else '', username='alice')
         if direction != 'local':
             profile = next(iter(self.app.servers.values()), None)
@@ -82,8 +82,9 @@ class GuiTests(unittest.TestCase):
         identifiers = [self.add_transfer('upload', 'upload-running'), self.add_transfer('download', 'download-failed'),
                        self.add_transfer('upload', 'upload-queued'), self.add_transfer('upload', 'upload-failed'),
                        self.add_transfer('download', 'download-running'), self.add_transfer('upload', 'upload-complete'),
-                       self.add_transfer('download', 'download-complete'), self.add_transfer('local', 'local-stopped')]
-        statuses = ('running', 'failed', 'queued', 'failed', 'scanning', 'success', 'success', 'cancelled')
+                       self.add_transfer('download', 'download-complete'), self.add_transfer('local', 'local-stopped'),
+                       self.add_transfer('remote', 'remote-running')]
+        statuses = ('running', 'failed', 'queued', 'failed', 'scanning', 'success', 'success', 'cancelled', 'running')
         snapshots = [replace(task, status=status) for task, status in zip(self.app.manager.snapshots(), statuses)]
         self.app._save_disabled = True
         with patch.object(self.app.manager, 'snapshots', return_value=snapshots):
@@ -105,11 +106,14 @@ class GuiTests(unittest.TestCase):
                 self.app.retry_failed()
                 start.assert_called_once_with([identifiers[3]])
             self.assertEqual(self.app.current_direction(), 'upload')
-            self.assertEqual(self.app.current_status(), 'all')
+            # Starting tasks jumps to the running tab so progress is visible.
+            self.assertEqual(self.app.current_status(), 'running')
             self.app.show_tasks('download', 'success')
             self.assertEqual([task.id for task in self.app.visible_tasks()], [identifiers[6]])
             self.app.show_tasks('local', 'cancelled')
             self.assertEqual([task.id for task in self.app.visible_tasks()], [identifiers[7]])
+            self.app.show_tasks('remote', 'running')
+            self.assertEqual([task.id for task in self.app.visible_tasks()], [identifiers[8]])
 
     def test_clear_only_current_category_and_keeps_live_or_queued_transfers(self):
         upload = self.add_transfer('upload', 'upload-complete', 'success')
@@ -129,6 +133,9 @@ class GuiTests(unittest.TestCase):
         self.app.manager.start([active, queued])
         self.wait_for(lambda: self.app.manager.get(active).status == 'running')
         self.app.show_tasks('local')
+        # With a throttled transfer running, the bar reflects this batch only.
+        self.wait_for(lambda: self.app.overall_bar.value() > 0)
+        self.assertIn('1 个运行中', self.app.overall_info.text())
         self.app.clear_button.click()
         self.assertIsNone(self.app.manager.get(local_complete))
         self.assertEqual(self.app.manager.get(active).status, 'running')
@@ -194,10 +201,16 @@ class GuiTests(unittest.TestCase):
         dialog.destination.setText(str(self.root / 'out'))
         dialog.submit()
         self.assertEqual(self.app.model.rowCount(), 2)
+        # Submitting a new task stays on the current view; starting jumps to running.
+        self.assertEqual(self.app.current_status(), 'all')
         self.app.start_all()
+        self.assertEqual(self.app.current_status(), 'running')
         self.wait_for(lambda: all(task.status == 'success' for task in self.app.manager.snapshots()))
         self.app.refresh()
-        self.assertEqual(self.app.overall_bar.value(), 1000)
+        # Finished tasks are history: the overall bar only tracks the active batch.
+        self.assertEqual(self.app.overall_bar.value(), 0)
+        self.assertIn('没有运行中的任务', self.app.overall_info.text())
+        self.app.show_tasks('local', 'success')
         self.app.table.selectRow(0)
         self.app.open_details()
         key = self.app.model.tasks[0].id
@@ -281,9 +294,15 @@ class GuiTests(unittest.TestCase):
         self.app.save_server(second)
         dialog = self.app.show_dialog(TaskDialog(self.app))
         dialog.source_endpoint.setCurrentIndex(dialog.source_endpoint.findData(first.id))
-        self.assertEqual(dialog.target_endpoint.count(), 1)
+        # With a remote source the target offers 本机 plus the same server only.
+        self.assertEqual(dialog.target_endpoint.count(), 2)
         self.assertEqual(dialog.target_endpoint.currentData(), '')
+        dialog.target_endpoint.setCurrentIndex(dialog.target_endpoint.findData(first.id))
+        self.assertIn('远端内部同步', dialog.route_hint.text())
         dialog.add_paths(['/data/目录'])
+        dialog.destination.setText('/srv/backup')
+        self.assertEqual(dialog.build_specs()[0].direction, 'remote')
+        dialog.target_endpoint.setCurrentIndex(dialog.target_endpoint.findData(''))
         dialog.destination.setText(str(self.root / 'out'))
         specs = dialog.build_specs()
         self.assertEqual(specs[0].direction, 'download')
@@ -300,6 +319,63 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(dialog.source_endpoint.currentData(), '')
         self.assertEqual(dialog.target_endpoint.currentData(), first.id)
         self.assertEqual(dialog.sources, [])
+
+    def test_contents_mode_option_in_dialog(self):
+        from rsync_client.engine import build_command
+        folder = self.root / 'data'
+        (folder / 'nested').mkdir(parents=True)
+        (folder / 'a.txt').write_text('a')
+        dialog = self.app.show_dialog(TaskDialog(self.app))
+        dialog.add_paths([str(folder)])
+        dialog.destination.setText(str(self.root / 'out'))
+        self.assertNotIn('内容直传', dialog.source_count.text())
+        dialog.contents.setChecked(True)
+        self.assertIn('内容直传', dialog.source_count.text())
+        specs = dialog.build_specs()
+        self.assertTrue(specs[0].sync_contents)
+        self.assertEqual(build_command(specs[0])[-2], str(folder) + '/')
+        dialog.submit()
+        self.assertTrue(self.app.manager.snapshots()[0].spec.sync_contents)
+        # Same-name directories are rejected normally but may merge in contents mode.
+        dialog = self.app.show_dialog(TaskDialog(self.app))
+        merge = self.root / 'other' / 'data'
+        merge.mkdir(parents=True)
+        dialog.add_paths([str(folder), str(merge)])
+        dialog.destination.setText(str(self.root / 'out2'))
+        with self.assertRaises(ValueError):
+            dialog.build_specs()
+        dialog.contents.setChecked(True)
+        self.assertEqual(len(dialog.build_specs()), 2)
+
+    def test_remote_internal_dialog_direction_and_directory_memory(self):
+        server = ServerProfile('备份机', '127.0.0.1', 'alice', port=1)
+        self.app.save_server(server)
+        dialog = self.app.show_dialog(TaskDialog(self.app))
+        dialog.source_endpoint.setCurrentIndex(dialog.source_endpoint.findData(server.id))
+        dialog.target_endpoint.setCurrentIndex(dialog.target_endpoint.findData(server.id))
+        self.assertIn('数据不经本机中转', dialog.route_hint.text())
+        self.assertEqual(dialog.destination.text(), '/')  # server initial directory
+        dialog.add_paths(['/srv/remote/源 目录'])
+        dialog.destination.setText('/srv/backup')
+        specs = dialog.build_specs()
+        self.assertEqual(specs[0].direction, 'remote')
+        self.assertEqual(specs[0].server_id, server.id)
+        self.assertEqual(specs[0].source, '/srv/remote/源 目录')
+        self.assertEqual(specs[0].destination, '/srv/backup')
+        dialog.submit()
+        self.assertEqual(self.app.last_directory_for(server.id, 'remote'), '/srv/backup')
+        self.assertEqual(self.app.last_directory_for(server.id, 'remote', 'source'), '/srv/remote')
+        self.assertEqual(self.app.model.tasks[0].spec.direction, 'remote')
+        # A fresh dialog pre-fills the remembered remote destination and picker start.
+        dialog = self.app.show_dialog(TaskDialog(self.app))
+        dialog.source_endpoint.setCurrentIndex(dialog.source_endpoint.findData(server.id))
+        dialog.target_endpoint.setCurrentIndex(dialog.target_endpoint.findData(server.id))
+        self.assertEqual(dialog.destination.text(), '/srv/backup')
+        self.assertEqual(dialog.pick_sources().location.text(), '/srv/remote')
+        # The download direction keeps an independent local destination.
+        dialog = self.app.show_dialog(TaskDialog(self.app))
+        dialog.source_endpoint.setCurrentIndex(dialog.source_endpoint.findData(server.id))
+        self.assertEqual(dialog.destination.text(), '')
 
     def test_server_login_remote_selection_and_download(self):
         folder = self.root / '远端目录'

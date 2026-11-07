@@ -5,14 +5,14 @@ import os
 import re
 import uuid
 from dataclasses import asdict, dataclass, field, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 STATUS_LABELS = {
     "ready": "待开始", "queued": "排队中", "scanning": "计算大小", "running": "传输中",
     "cancelling": "正在停止", "success": "已完成", "failed": "失败", "cancelled": "已停止",
 }
 ACTIVE = frozenset({"queued", "scanning", "running", "cancelling"})
-DIRECTIONS = {"local": "本地导出", "upload": "上传到远端", "download": "从远端下载"}
+DIRECTIONS = {"local": "本地同步", "upload": "上传到远端", "download": "从远端下载", "remote": "远端内部同步"}
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,7 @@ class TaskSpec:
     compression: bool = True
     bandwidth_kib: int = 0
     excludes: tuple[str, ...] = ()
+    sync_contents: bool = False
 
     def validate(self, *, check_paths: bool = True) -> None:
         for key in ("name", "source", "destination", "direction", "host", "username", "password", "identity_file", "credential_id", "server_id"):
@@ -39,6 +40,8 @@ class TaskSpec:
                 raise TypeError(f"配置字段 {key} 必须为文本")
         if not isinstance(self.excludes, (tuple, list)):
             raise TypeError("排除规则必须是列表")
+        if type(self.sync_contents) is not bool:
+            raise TypeError("内容直传选项必须为布尔值")
         if self.direction not in DIRECTIONS:
             raise ValueError("不支持的同步方向")
         if not self.name.strip() or not self.source.strip() or not self.destination.strip():
@@ -60,28 +63,48 @@ class TaskSpec:
                     raise ValueError("请输入有效的主机名、IPv4 或 IPv6 地址，不含协议及端口")
             if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@-]*", self.username):
                 raise ValueError("请输入有效的远端用户名")
-            remote_path = self.source if self.direction == "download" else self.destination
-            if not remote_path.startswith("/"):
-                raise ValueError("远端路径请使用绝对路径，例如 /home/user/data")
+            remote_paths = {"download": (self.source,), "upload": (self.destination,),
+                            "remote": (self.source, self.destination)}.get(self.direction, ())
+            for remote_path in remote_paths:
+                if not remote_path.startswith("/"):
+                    raise ValueError("远端路径请使用绝对路径，例如 /home/user/data")
             if self.identity_file and check_paths and not Path(self.identity_file).expanduser().is_file():
                 raise ValueError("SSH 私钥文件不存在")
-        if check_paths and self.direction != "download":
+        if check_paths and self.direction in ("local", "upload"):
             source = Path(self.source).expanduser()
             if not source.exists() and not source.is_symlink():
                 raise ValueError(f"源文件或目录不存在：{source}")
             if self.direction == "local":
                 destination = Path(self.destination).expanduser().resolve()
                 resolved = source.resolve()
-                # Each source keeps its basename in the common destination directory.
-                target = destination / source.name
-                if resolved == destination or resolved == target:
-                    raise ValueError("目标目录与源路径重叠，请选择其他目录")
-                if source.is_dir() and resolved in destination.parents:
-                    raise ValueError("目标目录不能位于源目录内部")
-        if check_paths and self.direction != "upload":
+                if self.sync_contents:
+                    # Contents land directly in the destination directory itself.
+                    if resolved == destination:
+                        raise ValueError("内容直传需要与源不同的目标目录")
+                    if source.is_dir() and resolved in destination.parents:
+                        raise ValueError("目标目录不能位于源目录内部")
+                else:
+                    # Each source keeps its basename in the common destination directory.
+                    target = destination / source.name
+                    if resolved == destination or resolved == target:
+                        raise ValueError("目标目录与源路径重叠，请选择其他目录")
+                    if source.is_dir() and resolved in destination.parents:
+                        raise ValueError("目标目录不能位于源目录内部")
+        if check_paths and self.direction in ("local", "download"):
             destination = Path(self.destination).expanduser()
             if destination.exists() and not destination.is_dir():
                 raise ValueError("目标路径必须是目录")
+        if self.direction == "remote":
+            # Paths live on the server; compare them lexically to forbid self-overlap.
+            source_path = PurePosixPath(self.source.rstrip("/") or "/")
+            destination_path = PurePosixPath(self.destination.rstrip("/") or "/")
+            if self.sync_contents:
+                if source_path == destination_path or source_path in destination_path.parents:
+                    raise ValueError("内容直传时目标目录不能与源目录相同或位于其内部")
+            elif source_path == destination_path or (source_path.name and source_path == destination_path / source_path.name):
+                raise ValueError("目标目录与源路径重叠，请选择其他目录")
+            elif source_path in destination_path.parents:
+                raise ValueError("目标目录不能位于源目录内部")
         if any(not isinstance(pattern, str) or "\0" in pattern for pattern in self.excludes):
             raise ValueError("排除规则无效")
         for hop in self.jump_hosts:

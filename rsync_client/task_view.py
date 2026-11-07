@@ -4,7 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import QSortFilterProxyModel
 
 RUNNING = frozenset({'scanning', 'running', 'cancelling'})
-DIRECTION_TABS = (('upload', '↑ 上传'), ('download', '↓ 下载'), ('local', '本地导出'))
+DIRECTION_TABS = (('upload', '↑ 上传'), ('download', '↓ 下载'), ('local', '本地同步'), ('remote', '⇄ 远端互同步'))
 STATUS_TABS = (('all', '全部'), ('pending', '待开始 / 排队'), ('running', '运行中'),
                ('success', '已完成'), ('failed', '已失败'), ('cancelled', '已停止'))
 
