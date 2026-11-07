@@ -186,8 +186,7 @@ class ServerManager(Modal):
 
     def disconnect(self):
         if profile := self.selected():
-            self.app.remote.disconnect(profile.id)
-            self.app.server_messages[profile.id] = '已断开浏览连接'
+            self.app.disconnect_server(profile.id)
 
     def delete(self):
         if profile := self.selected():
@@ -271,7 +270,7 @@ class TaskDialog(Modal):
         layout.addWidget(self.source_count)
         target = QGroupBox('目标目录')
         box = QHBoxLayout(target)
-        self.destination = QLineEdit(spec.destination if spec else app.last_destination)
+        self.destination = QLineEdit(spec.destination if spec else '')
         box.addWidget(self.destination, 1)
         box.addWidget(button('浏览目录…', self.choose_destination))
         layout.addWidget(target)
@@ -296,6 +295,20 @@ class TaskDialog(Modal):
         self.source_endpoint.currentIndexChanged.connect(lambda index: self.endpoints_changed(True))
         self.target_endpoint.currentIndexChanged.connect(lambda index: self.endpoints_changed(False))
         self.refresh_sources()
+        if not spec:
+            self.apply_destination_default()
+
+    def apply_destination_default(self, source=None, target=None):
+        """Pre-fill the destination with the remembered directory for this server and direction."""
+        source = self._source if source is None else source
+        target = self._target if target is None else target
+        if source:  # download: destination is a local directory
+            path = self.app.last_directory_for(source, 'download')
+        elif target:  # upload: destination is a remote directory
+            path = self.app.last_directory_for(target, 'upload') or self.app.servers[target].initial_directory
+        else:  # local to local
+            path = self.app.last_directory_for('', 'local')
+        self.destination.setText(path)
 
     def refresh_endpoints(self):
         if self._source and self._source not in self.app.servers:
@@ -337,16 +350,16 @@ class TaskDialog(Modal):
         if source_changed and source != self._source:
             self.sources.clear()
             self.refresh_sources()
-        if target != self._target or source and self._target:
-            self.destination.setText(self.app.servers[target].initial_directory if target and not source else '')
+        if source != self._source or target != self._target:
+            self.apply_destination_default(source, target)
         self._source, self._target = source, target
         self.update_route()
 
     def swap(self):
         self._source, self._target = self._target, self._source
         self.sources.clear()
-        self.destination.setText(self.app.servers[self._target].initial_directory if self._target else '')
         self.refresh_endpoints()
+        self.apply_destination_default()
         self.refresh_sources()
 
     def refresh_sources(self):
@@ -367,13 +380,23 @@ class TaskDialog(Modal):
         self.refresh_sources()
 
     def pick_sources(self):
-        picker = RemotePicker(self, self.app, self._source, self.add_paths) if self._source else MixedPicker(self, self.add_paths)
+        if self._source:  # download: sources live on the remote server
+            initial = self.app.last_directory_for(self._source, 'download', 'source')
+            picker = RemotePicker(self, self.app, self._source, self.add_paths, initial=initial)
+        else:  # upload / local: sources live on this machine
+            direction = 'upload' if self._target else 'local'
+            initial = self.app.last_directory_for(self._target, direction, 'source')
+            picker = MixedPicker(self, self.add_paths, initial=initial)
         return self.app.show_dialog(picker)
 
     def choose_destination(self):
         if self._target:
-            return self.app.show_dialog(RemotePicker(self, self.app, self._target, self.destination.setText, directory_only=True))
-        path = QFileDialog.getExistingDirectory(self, '选择目标目录')
+            initial = self.app.last_directory_for(self._target, 'upload')
+            return self.app.show_dialog(RemotePicker(self, self.app, self._target, self.destination.setText,
+                                                     directory_only=True, initial=initial))
+        direction = 'download' if self._source else 'local'
+        server_id = self._source or ''
+        path = QFileDialog.getExistingDirectory(self, '选择目标目录', self.app.last_directory_for(server_id, direction))
         if path:
             self.destination.setText(path)
         return None
@@ -435,7 +458,10 @@ class TaskDialog(Modal):
             else:
                 for spec in specs:
                     self.app.manager.add(spec)
-            self.app.last_destination = self.destination.text()
+            direction = specs[0].direction
+            server_id = self._source if direction == 'download' else self._target if direction == 'upload' else ''
+            source_hint = str(PurePosixPath(self.sources[-1]).parent) if self.sources else ''
+            self.app.remember_directories(server_id, direction, source=source_hint, destination=self.destination.text())
             self.app.persist()
             self.app.show_tasks(specs[0].direction)
             self.accept()

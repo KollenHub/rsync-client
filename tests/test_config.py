@@ -12,6 +12,29 @@ from rsync_client.models import ServerProfile, TaskSpec, connection_route
 
 
 class ServerConfigTests(unittest.TestCase):
+    def test_direction_directories_round_trip_and_invalid_entries_dropped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'tasks.json'
+            server = ServerProfile('backup', 'backup.example', 'alice')
+            directories = {
+                server.id: {'upload': {'source': '/home/alice/data', 'destination': '/srv/backup'},
+                            'download': {'source': '/srv/remote', 'destination': '/home/alice/restore'}},
+                '': {'local': {'destination': '/home/alice/mirror'}},
+            }
+            save_config(path, [], 2, [server], last_directories=directories)
+            _, _, _, restored = load_config(path)
+            self.assertEqual(restored[server.id]['upload']['destination'], '/srv/backup')
+            self.assertEqual(restored[server.id]['download']['source'], '/srv/remote')
+            self.assertEqual(restored['']['local']['destination'], '/home/alice/mirror')
+            path.write_text(json.dumps({
+                'version': 2, 'concurrency': 2, 'servers': [server.public_dict()], 'tasks': [],
+                'last_directories': {server.id: {'upload': 'plain-destination', 'bogus': {'x': 1}, 'download': 5}}
+            }))
+            _, _, _, restored = load_config(path)
+            self.assertEqual(restored[server.id]['upload']['destination'], 'plain-destination')
+            self.assertNotIn('download', restored[server.id])
+            self.assertNotIn('bogus', restored[server.id])
+
     def test_saved_history_is_restored_and_credentials_are_redacted(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'tasks.json'
@@ -49,7 +72,7 @@ class ServerConfigTests(unittest.TestCase):
                              username="user@root@10.0.0.2", port=2222, credential_id="old-vault-reference")
             second = replace(first, name="second", source="/remote/two")
             path.write_text(json.dumps({"version": 1, "concurrency": 3, "tasks": [first.public_dict(), second.public_dict()]}))
-            specs, concurrency, servers = load_config(path)
+            specs, concurrency, servers, _ = load_config(path)
             self.assertEqual(len(servers), 1)
             self.assertEqual(concurrency, 3)
             self.assertEqual(servers[0].credential_id, "old-vault-reference")
@@ -59,7 +82,7 @@ class ServerConfigTests(unittest.TestCase):
             self.assertEqual(data["version"], 2)
             self.assertNotIn("host", data["tasks"][0])
             self.assertNotIn("credential_id", data["tasks"][0])
-            restored, _, profiles = load_config(path)
+            restored, _, profiles, _ = load_config(path)
             self.assertEqual(restored[0].username, first.username)
             self.assertEqual(profiles[0].port, 2222)
 
@@ -74,7 +97,7 @@ class ServerConfigTests(unittest.TestCase):
             raw = path.read_text()
             for secret in (jump.password, target.password):
                 self.assertNotIn(secret, raw)
-            specs, _, profiles = load_config(path)
+            specs, _, profiles, _ = load_config(path)
             self.assertEqual(specs[0].host, "new-target.example")
             self.assertEqual(specs[0].port, 2222)
             self.assertEqual(specs[0].jump_hosts[0].id, jump.id)

@@ -25,7 +25,7 @@ class LocalFileModel(QFileSystemModel):
 
 
 class MixedPicker(Modal):
-    def __init__(self, parent, callback):
+    def __init__(self, parent, callback, initial=''):
         super().__init__(parent)
         self.callback, self.basket = callback, {}
         self.setWindowTitle('选择多个文件和目录')
@@ -33,7 +33,7 @@ class MixedPicker(Modal):
         self.setMinimumSize(650, 420)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
-        self.location = QLineEdit(str(Path.home()))
+        self.location = QLineEdit(initial or str(Path.home()))
         nav = QHBoxLayout()
         nav.addWidget(button('↑ 上一级', self.up))
         nav.addWidget(self.location, 1)
@@ -106,7 +106,7 @@ class MixedPicker(Modal):
 
 
 class RemotePicker(Modal):
-    def __init__(self, parent, app, server_id, callback, *, directory_only=False):
+    def __init__(self, parent, app, server_id, callback, *, directory_only=False, initial=''):
         super().__init__(parent)
         self.app, self.server_id, self.callback = app, server_id, callback
         self.directory_only = directory_only
@@ -118,7 +118,7 @@ class RemotePicker(Modal):
         self.setMinimumSize(700, 440)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
-        self.location = QLineEdit(app.servers[server_id].initial_directory)
+        self.location = QLineEdit(initial or app.servers[server_id].initial_directory)
         nav = QHBoxLayout()
         nav.addWidget(button('↑ 上一级', self.up))
         nav.addWidget(self.location, 1)

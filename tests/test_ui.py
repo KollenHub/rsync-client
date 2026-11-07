@@ -206,6 +206,43 @@ class GuiTests(unittest.TestCase):
         self.assertTrue((self.root / 'out' / 'report.pdf').exists())
         self.assertTrue((self.root / 'out' / 'photos' / 'photo.bin').exists())
 
+    def test_destination_memory_kept_per_server_and_direction(self):
+        # A closed local port fails fast so the remote picker never blocks on DNS or TCP timeouts.
+        server = ServerProfile('备份机', '127.0.0.1', 'alice', port=1)
+        self.app.save_server(server)
+        project = self.root / 'project'
+        project.mkdir()
+        dialog = self.app.show_dialog(TaskDialog(self.app))
+        dialog.target_endpoint.setCurrentIndex(dialog.target_endpoint.findData(server.id))
+        self.assertEqual(dialog.destination.text(), '/')
+        dialog.add_paths([str(project)])
+        dialog.destination.setText('/srv/backup')
+        dialog.submit()
+
+        dialog = self.app.show_dialog(TaskDialog(self.app))
+        dialog.source_endpoint.setCurrentIndex(dialog.source_endpoint.findData(server.id))
+        dialog.add_paths(['/srv/remote/source'])
+        dialog.destination.setText(str(self.root / 'restore'))
+        dialog.submit()
+
+        self.assertEqual(self.app.last_directory_for(server.id, 'upload'), '/srv/backup')
+        self.assertEqual(self.app.last_directory_for(server.id, 'upload', 'source'), str(self.root))
+        self.assertEqual(self.app.last_directory_for(server.id, 'download'), str(self.root / 'restore'))
+        self.assertEqual(self.app.last_directory_for(server.id, 'download', 'source'), '/srv/remote')
+
+        # A fresh upload dialog pre-fills the remote destination and picker start.
+        dialog = self.app.show_dialog(TaskDialog(self.app))
+        dialog.target_endpoint.setCurrentIndex(dialog.target_endpoint.findData(server.id))
+        self.assertEqual(dialog.destination.text(), '/srv/backup')
+        picker = dialog.pick_sources()
+        self.assertEqual(picker.location.text(), str(self.root))
+        # The download direction remembers an independent local destination.
+        dialog = self.app.show_dialog(TaskDialog(self.app))
+        dialog.source_endpoint.setCurrentIndex(dialog.source_endpoint.findData(server.id))
+        self.assertEqual(dialog.destination.text(), str(self.root / 'restore'))
+        picker = dialog.pick_sources()
+        self.assertEqual(picker.location.text(), '/srv/remote')
+
     def test_saved_server_is_reused_after_restart(self):
         source = self.root / 'report.txt'
         source.write_text('data')

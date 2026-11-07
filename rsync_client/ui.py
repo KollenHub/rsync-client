@@ -187,12 +187,13 @@ class App(QMainWindow):
         self.server_messages = {}
         self.connecting = set()
         self.dialogs = []
-        self.last_destination = ''
+        self.last_directories: dict[str, dict[str, dict[str, str]]] = {}
         self._results, self._callbacks = queue.Queue(), {}
         self._next_job, self._closing = 0, False
         error = None
         try:
-            specs, concurrency, servers = load_config(self.config_path)
+            specs, concurrency, servers, last_directories = load_config(self.config_path)
+            self.last_directories = last_directories
             states = load_task_states(self.config_path)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             specs, concurrency, servers, states, error = [], 2, [], [], str(exc)
@@ -334,8 +335,21 @@ class App(QMainWindow):
 
     def show_dialog(self, dialog):
         self.dialogs.append(dialog)
-        dialog.finished.connect(lambda result: self.dialogs.remove(dialog) if dialog in self.dialogs else None)
+        parent = dialog.parentWidget()
+
+        def closed(_result):
+            if dialog in self.dialogs:
+                self.dialogs.remove(dialog)
+            # Some window managers drop the parent behind the main window when a
+            # child dialog closes; bring it back to the front explicitly.
+            if parent is not None and parent.isVisible():
+                parent.raise_()
+                parent.activateWindow()
+
+        dialog.finished.connect(closed)
         dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
         return dialog
 
     def new_transfer(self):
@@ -427,13 +441,39 @@ class App(QMainWindow):
         try:
             snapshots = self.manager.snapshots()
             save_config(self.config_path, [s.spec for s in snapshots], self.concurrency.value(), list(self.servers.values()),
-                        states=[s.public_state() for s in snapshots])
+                        states=[s.public_state() for s in snapshots], last_directories=self.last_directories)
             self._runtime_signature = tuple((task.id, task.status) for task in snapshots)
         except (OSError, ValueError) as exc:
             self._runtime_signature = self.runtime_signature()
             self.footer.setText(f'保存失败：{exc}')
             if not quiet:
                 QMessageBox.critical(self, '配置保存失败', str(exc))
+
+    def last_directory_for(self, server_id: str, direction: str, kind: str = 'destination') -> str:
+        """Last used source/destination directory for one server and transfer direction."""
+        return self.last_directories.get(server_id or '', {}).get(direction, {}).get(kind, '')
+
+    def remember_directories(self, server_id: str, direction: str, source: str = '', destination: str = '') -> None:
+        entry = self.last_directories.setdefault(server_id or '', {}).setdefault(direction, {})
+        changed = False
+        for kind, path in (('source', source.strip()), ('destination', destination.strip())):
+            if path and entry.get(kind) != path:
+                entry[kind] = path
+                changed = True
+        if changed:
+            self.persist(quiet=True)
+
+    def disconnect_server(self, server_id: str, message: str | None = '已断开浏览连接') -> None:
+        """Close the SSH browsing session off the GUI thread; paramiko teardown blocks."""
+        service = self.remote
+
+        def done(_result, error):
+            if error:
+                self.server_messages[server_id] = f'断开失败：{error}'
+            elif message:
+                self.server_messages[server_id] = message
+
+        self.background(lambda: service.disconnect(server_id), done)
 
     def unlock_vault(self, parent=None):
         if self.vault.unlocked:
@@ -567,7 +607,7 @@ class App(QMainWindow):
                 elif callbacks[1]:
                     callbacks[1](result)
         self.refresh()
-        self.timer.setInterval(20 if not self._results.empty() else 100)
+        self.timer.setInterval(50 if not self._results.empty() else 100)
 
     def background(self, work, callback, *, on_progress=None):
         secrets = tuple(p.password for p in self.servers.values() if p.password)
@@ -618,7 +658,7 @@ class App(QMainWindow):
         self.servers[profile.id] = profile
         for candidate in self.servers.values():
             if any(p.id == profile.id for p in connection_route(candidate, self.servers)):
-                self.remote.disconnect(candidate.id)
+                self.disconnect_server(candidate.id, message=None)
                 self.server_messages.pop(candidate.id, None)
         self.persist()
 
@@ -629,8 +669,10 @@ class App(QMainWindow):
             raise ValueError('服务器仍被任务引用，请先移除或修改相关任务')
         if any(s.jump_server_id == server_id for s in self.servers.values()):
             raise ValueError('服务器仍被用作跳板机，请先修改相关服务器')
-        self.remote.disconnect(server_id)
+        self.disconnect_server(server_id, message=None)
+        self.server_messages.pop(server_id, None)
         del self.servers[server_id]
+        self.last_directories.pop(server_id, None)
         self.persist()
 
     def resolve_server(self, server_id, parent=None):
@@ -669,7 +711,8 @@ class App(QMainWindow):
             self.persist()
             self._closing = True
             self._callbacks.clear()
-            self.remote.close()
+            # SSH teardown can block on network IO; keep the GUI responsive while closing.
+            threading.Thread(target=self.remote.close, daemon=True).start()
             self.manager.stop([task.id for task in self.manager.snapshots()])
             self.centralWidget().setEnabled(False)
         if any(task.status in ACTIVE for task in self.manager.snapshots()):
