@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -42,14 +43,17 @@ from .vault import Vault
 
 
 class TaskModel(QAbstractTableModel):
-    HEADERS = ('文件 / 目录', '传输方向', '目标目录', '状态', '进度', '已处理 / 待更新', '速度', '剩余时间')
+    HEADERS = ('文件 / 目录', '组', '传输方向', '目标目录', '状态', '进度', '已处理 / 待更新', '速度', '剩余时间')
 
     def __init__(self, app):
         super().__init__(app)
         self.app, self.tasks = app, []
+        self.expanded: set[str] = set()
+        # display rows: ('group', gid, members) or ('task', task.id, [snapshot])
+        self.display: list[tuple] = []
 
     def rowCount(self, parent=None):
-        return 0 if parent is not None and parent.isValid() else len(self.tasks)
+        return 0 if parent is not None and parent.isValid() else len(self.display)
 
     def columnCount(self, parent=None):
         return len(self.HEADERS)
@@ -59,16 +63,77 @@ class TaskModel(QAbstractTableModel):
             return self.HEADERS[section]
         return None
 
+    @staticmethod
+    def _group_status(members):
+        if any(m.status in ACTIVE for m in members):
+            return 'running'
+        if any(m.status == 'failed' for m in members):
+            return 'failed'
+        if all(m.status == 'success' for m in members):
+            return 'success'
+        return 'ready'
+
+    def _rebuild(self, snapshots) -> list[tuple]:
+        groups: dict[str, list] = {}
+        order: list[tuple[str, str]] = []
+        by_id = {}
+        for s in snapshots:
+            by_id[s.id] = s
+            gid = s.spec.group_id
+            if gid:
+                if gid not in groups:
+                    groups[gid] = []
+                    order.append(('group', gid))
+                groups[gid].append(s)
+            else:
+                order.append(('task', s.id))
+        rows = []
+        for kind, key in order:
+            if kind == 'task':
+                rows.append(('task', key, [by_id[key]]))
+            else:
+                rows.append(('group', key, groups[key]))
+                if key in self.expanded:
+                    rows.extend(('task', m.id, [m]) for m in groups[key])
+        return rows
+
+    def _structure(self, display) -> tuple:
+        return tuple((kind, key, len(members)) for kind, key, members in display)
+
+    def update_tasks(self, snapshots):
+        display = self._rebuild(snapshots)
+        if [t.id for t in snapshots] != [t.id for t in self.tasks] or self._structure(display) != self._structure(self.display):
+            self.beginResetModel()
+            self.tasks = snapshots
+            self.display = display
+            self.endResetModel()
+        elif snapshots != self.tasks:
+            self.tasks = snapshots
+            self.display = display
+            if display:
+                self.dataChanged.emit(self.index(0, 0), self.index(len(display) - 1, self.columnCount() - 1))
+
+    def toggle_group(self, gid: str):
+        self.expanded.symmetric_difference_update({gid})
+        self.beginResetModel()
+        self.display = self._rebuild(self.tasks)
+        self.endResetModel()
+
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
-        task = self.tasks[index.row()]
+        kind, key, members = self.display[index.row()]
+        if kind == 'group':
+            return self._group_data(index, role, key, members)
+        task = members[0]
         if role == Qt.ItemDataRole.UserRole:
             return task.id
         if role == Qt.ItemDataRole.UserRole + 1:
             return task.percent
         if role == Qt.ItemDataRole.ToolTipRole:
-            return f'{task.spec.source}\n→ {task.spec.destination}' + (f'\n{task.error}' if task.error else '')
+            return (f'{task.spec.source}\n→ {task.spec.destination}'
+                    + (f'\n当前：{task.current_file}' if task.current_file else '')
+                    + (f'\n{task.error}' if task.error else ''))
         if role == Qt.ItemDataRole.ForegroundRole:
             color = {'success': '#17866e', 'failed': '#c24454', 'running': '#6554d9', 'cancelled': '#64748b'}.get(task.status)
             return QColor(color) if color else None
@@ -80,22 +145,48 @@ class TaskModel(QAbstractTableModel):
                      f'{server} → 本机' if task.spec.direction == 'download' else
                      f'本机 → {server}' if task.spec.direction == 'upload' else '本机 → 本机')
         total = format_bytes(task.total_bytes) if task.total_bytes is not None else '—'
-        progress = '正在扫描…' if task.status == 'scanning' else '等待扫描' if task.status in {'ready', 'queued'} else f'{task.percent:.1f}%'
-        values = (task.spec.name, direction, task.spec.destination, STATUS_LABELS[task.status], progress,
+        progress = (f'扫描中 · 已发现 {task.scanned_files} 项' if task.scanned_files else '正在扫描…') \
+            if task.status == 'scanning' else '等待扫描' if task.status in {'ready', 'queued'} else f'{task.percent:.1f}%'
+        indent = '    ' if task.spec.group_id in self.expanded else ''
+        values = (indent + task.spec.name, task.spec.group_name or '—', direction, task.spec.destination, STATUS_LABELS[task.status], progress,
                   f'{format_bytes(task.transferred_bytes)} / {total}',
                   f'{format_bytes(task.speed)}/s' if task.status == 'running' else '—',
                   task.eta if task.status == 'running' else '—')
         return values[index.column()]
 
-    def update_tasks(self, snapshots):
-        if [task.id for task in snapshots] != [task.id for task in self.tasks]:
-            self.beginResetModel()
-            self.tasks = snapshots
-            self.endResetModel()
-        elif snapshots != self.tasks:
-            self.tasks = snapshots
-            if snapshots:
-                self.dataChanged.emit(self.index(0, 0), self.index(len(snapshots) - 1, self.columnCount() - 1))
+    def _group_data(self, index, role, gid, members):
+        summary = summarize(members)
+        status = self._group_status(members)
+        if role == Qt.ItemDataRole.UserRole:
+            return f'group:{gid}'
+        if role == Qt.ItemDataRole.UserRole + 1:
+            return summary.percent
+        if role == Qt.ItemDataRole.ForegroundRole:
+            color = {'success': '#17866e', 'failed': '#c24454', 'running': '#6554d9'}.get(status)
+            return QColor(color) if color else None
+        if role == Qt.ItemDataRole.ToolTipRole:
+            done = sum(m.status == 'success' for m in members)
+            state = '收起' if gid in self.expanded else '展开'
+            return f'组内 {len(members)} 个任务，{done} 个已完成\n双击{state}'
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        first = members[0]
+        profile = self.app.servers.get(first.spec.server_id)
+        server = profile.name if profile else first.spec.host
+        direction = (f'{server} → {server}' if first.spec.direction == 'remote' else
+                     f'{server} → 本机' if first.spec.direction == 'download' else
+                     f'本机 → {server}' if first.spec.direction == 'upload' else '本机 → 本机')
+        destinations = [m.spec.destination for m in members]
+        common = os.path.commonprefix(destinations)
+        if common != destinations[0]:
+            common = common.rsplit('/', 1)[0] or common
+        marker = '▾' if gid in self.expanded else '▸'
+        name = first.spec.group_name or '任务组'
+        values = (f'{marker} {name}（{len(members)} 个任务）', name, direction, common,
+                  STATUS_LABELS.get(status, status), f'{summary.percent:.1f}%',
+                  f'{format_bytes(summary.transferred_bytes)} / {format_bytes(summary.total_bytes)}',
+                  f'{format_bytes(summary.speed)}/s' if status == 'running' else '—', '—')
+        return values[index.column()]
 
 
 class ProgressDelegate(QStyledItemDelegate):
@@ -189,6 +280,8 @@ class App(QMainWindow):
         self.remote = RemoteService()
         self.details = {}
         self.server_window = None
+        self.expand_window = None
+        self.expansion_records = []  # window-independent expansion state
         self.server_messages = {}
         self.connecting = set()
         self.dialogs = []
@@ -235,6 +328,8 @@ class App(QMainWindow):
         header.addWidget(logo)
         header.addLayout(brand, 1)
         header.addWidget(button('服务器管理', self.open_servers))
+        self.expand_button = button('解析列表', self.open_expansions)
+        header.addWidget(self.expand_button)
         header.addWidget(button('＋ 新建传输', self.new_transfer, primary=True))
         layout.addLayout(header)
         metrics = QHBoxLayout()
@@ -287,7 +382,7 @@ class App(QMainWindow):
         toolbar.addStretch()
         toolbar.addWidget(label('并发任务数', 'muted'))
         self.concurrency = QSpinBox()
-        self.concurrency.setRange(1, 8)
+        self.concurrency.setRange(1, 16)
         self.concurrency.setValue(concurrency)
         self.concurrency.valueChanged.connect(self._concurrency_changed)
         toolbar.addWidget(self.concurrency)
@@ -307,16 +402,17 @@ class App(QMainWindow):
         self.table.verticalHeader().setDefaultSectionSize(46)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
-        for n, width in enumerate((195, 170, 230, 100, 145, 180, 90, 90)):
+        for n, width in enumerate((185, 105, 145, 210, 92, 140, 175, 85, 85)):
             self.table.setColumnWidth(n, width)
-        self.table.setItemDelegateForColumn(4, ProgressDelegate(self.table))
-        self.table.doubleClicked.connect(self.open_details)
+        self.table.setItemDelegateForColumn(5, ProgressDelegate(self.table))
+        self.table.doubleClicked.connect(self.row_activated)
         self.table.selectionModel().selectionChanged.connect(self.selected_info)
         layout.addWidget(self.table, 1)
         actions = QHBoxLayout()
-        actions.addWidget(label('Ctrl / Shift 多选 · 双击查看终端日志', 'muted'), 1)
+        actions.addWidget(label('Ctrl / Shift 多选 · 双击组行展开 / 收起 · 双击任务查看日志', 'muted'), 1)
         for text, command in (('命令预览', self.preview_selected), ('查看详情 / 日志', self.open_details),
-                              ('编辑传输', self.edit_selected), ('移除选中', self.remove_selected)):
+                              ('编辑传输', self.edit_selected), ('移除选中', self.remove_selected),
+                              ('开始整组', self.start_group), ('停止整组', self.stop_group), ('移除整组', self.remove_group)):
             actions.addWidget(button(text, command))
         self.clear_button = button('清空列表', self.clear_current)
         self.clear_button.setToolTip('仅清空当前方向、当前分类中的非活动任务记录；运行中和排队中的任务会保留，不删除传输文件。')
@@ -362,7 +458,15 @@ class App(QMainWindow):
         return self.show_dialog(TaskDialog(self))
 
     def selected_ids(self):
-        return [index.data(Qt.ItemDataRole.UserRole) for index in self.table.selectionModel().selectedRows()]
+        ids, seen = [], set()
+        for index in self.table.selectionModel().selectedRows():
+            source = self.proxy.mapToSource(index).row()
+            kind, _key, members = self.model.display[source]
+            for member in (members if kind == 'group' else members[:1]):
+                if member.id not in seen:
+                    seen.add(member.id)
+                    ids.append(member.id)
+        return ids
 
     def current_direction(self):
         return DIRECTION_TABS[self.direction_tabs.currentIndex()][0]
@@ -385,8 +489,15 @@ class App(QMainWindow):
         self.refresh()
 
     def visible_tasks(self):
-        return [self.model.tasks[self.proxy.mapToSource(self.proxy.index(index, 0)).row()]
-                for index in range(self.proxy.rowCount())]
+        # Group rows and expanded member rows overlap; keep each task once.
+        visible, seen = [], set()
+        for index in range(self.proxy.rowCount()):
+            source = self.proxy.mapToSource(self.proxy.index(index, 0)).row()
+            for member in self.model.display[source][2]:
+                if member.id not in seen:
+                    seen.add(member.id)
+                    visible.append(member)
+        return visible
 
     def runtime_signature(self):
         return tuple((task.id, task.status) for task in self.manager.snapshots())
@@ -447,6 +558,8 @@ class App(QMainWindow):
         visible = self.visible_tasks()
         self.retry_button.setEnabled(any(task.status == 'failed' for task in visible))
         self.clear_button.setEnabled(any(task.status not in ACTIVE for task in visible))
+        pending = sum(1 for r in self.expansion_records if r['status'] == 'pending')
+        self.expand_button.setText(f'解析列表 ●{pending}' if pending else '解析列表')
         self.selected_info()
         if self.runtime_signature() != self._runtime_signature:
             self.persist(quiet=True)
@@ -584,6 +697,49 @@ class App(QMainWindow):
         self.persist()
         self.refresh()
 
+    def _group_ids(self, ids):
+        """Expand a selection to every task that shares a wildcard-expansion group."""
+        groups = set()
+        for task_id in ids:
+            snapshot = self.manager.get(task_id)
+            if snapshot and snapshot.spec.group_id:
+                groups.add(snapshot.spec.group_id)
+        if not groups:
+            return list(ids)
+        return [s.id for s in self.manager.snapshots() if s.spec.group_id in groups]
+
+    def start_group(self):
+        ids = [i for i in self._group_ids(self.selected_ids())
+               if (task := self.manager.get(i)) and task.status not in ACTIVE]
+        if ids:
+            self.start(ids)
+
+    def stop_group(self):
+        self.manager.stop(self._group_ids(self.selected_ids()))
+
+    def remove_group(self):
+        ids = self._group_ids(self.selected_ids())
+        if not ids:
+            return
+        if any(self.manager.get(i).status in ACTIVE for i in ids):
+            QMessageBox.information(self, '任务进行中', '请先停止整组任务再移除。')
+            return
+        for task_id in ids:
+            self.manager.remove(task_id)
+            if task_id in self.details:
+                self.details[task_id].close()
+        self.persist()
+        self.refresh()
+        self.footer.setText(f'已移除整组 {len(ids)} 条任务。')
+
+    def row_activated(self, index):
+        source = self.proxy.mapToSource(index).row()
+        kind, key, _members = self.model.display[source]
+        if kind == 'group':
+            self.model.toggle_group(key)
+        else:
+            self.open_details()
+
     def open_details(self, *args):
         if ids := self.selected_ids():
             task_id = ids[0]
@@ -623,7 +779,7 @@ class App(QMainWindow):
                 elif callbacks[1]:
                     callbacks[1](result)
         self.refresh()
-        self.timer.setInterval(50 if not self._results.empty() else 100)
+        self.timer.setInterval(50 if not self._results.empty() else 1000)
 
     def background(self, work, callback, *, on_progress=None):
         secrets = tuple(p.password for p in self.servers.values() if p.password)
@@ -654,6 +810,39 @@ class App(QMainWindow):
         else:
             self.server_window = self.show_dialog(ServerManager(parent or self, self))
         return self.server_window
+
+    def open_expansions(self, parent=None):
+        from .dialogs import ExpansionMonitor
+        if self.expand_window:
+            self.expand_window.raise_()
+            self.expand_window.activateWindow()
+        else:
+            self.expand_window = self.show_dialog(ExpansionMonitor(parent or self, self))
+        return self.expand_window
+
+    def _expansion_update(self, key, status, detail=''):
+        """Mutate one expansion record, then refresh the monitor if it is open."""
+        for record in self.expansion_records:
+            if record['key'] == key:
+                record['status'], record['detail'] = status, detail
+                break
+        if self.expand_window:
+            self.expand_window.refresh()
+
+    def add_expansion(self, path):
+        import uuid
+        key = uuid.uuid4().hex
+        self.expansion_records.append({'key': key, 'path': path, 'status': 'pending',
+                                       'detail': '正在连接并列出目录……'})
+        if self.expand_window:
+            self.expand_window.refresh()
+        return key
+
+    def expansion_progress(self, key, count, sample):
+        self._expansion_update(key, 'pending', f'已发现 {count} 项 · {sample.rsplit("/", 1)[-1]}')
+
+    def expansion_finish(self, key, ok, detail):
+        self._expansion_update(key, 'done' if ok else 'failed', detail)
 
     def server_busy(self, server_id):
         return any(any(p.id == server_id for p in connection_route(self.servers[key], self.servers))

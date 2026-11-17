@@ -13,6 +13,25 @@ STATUS_LABELS = {
 }
 ACTIVE = frozenset({"queued", "scanning", "running", "cancelling"})
 DIRECTIONS = {"local": "本地同步", "upload": "上传到远端", "download": "从远端下载", "remote": "远端内部同步"}
+WILDCARD_CHARS = "*?["
+MAX_RECURSION_SEGMENTS = 4
+
+
+def has_wildcards(path: str) -> bool:
+    """True when the path contains glob characters (* ? [)."""
+    return any(char in path for char in WILDCARD_CHARS)
+
+
+def split_wildcard(path: str) -> tuple[str, str]:
+    """Split a wildcard path into (literal prefix, wildcard remainder).
+
+    "/a/b/**/Pose*" becomes ("/a/b", "**/Pose*"): the prefix ends right before
+    the first path segment containing a wildcard character.
+    """
+    segments = path.split("/")
+    cut = next((i for i, segment in enumerate(segments)
+                if segment and has_wildcards(segment)), len(segments))
+    return "/".join(segments[:cut]) or "/", "/".join(segments[cut:])
 
 
 @dataclass(frozen=True)
@@ -33,9 +52,11 @@ class TaskSpec:
     bandwidth_kib: int = 0
     excludes: tuple[str, ...] = ()
     sync_contents: bool = False
+    group_id: str = ""  # wildcard expansions share one id per batch
+    group_name: str = ""
 
     def validate(self, *, check_paths: bool = True) -> None:
-        for key in ("name", "source", "destination", "direction", "host", "username", "password", "identity_file", "credential_id", "server_id"):
+        for key in ("name", "source", "destination", "direction", "host", "username", "password", "identity_file", "credential_id", "server_id", "group_id", "group_name"):
             if not isinstance(getattr(self, key), str):
                 raise TypeError(f"配置字段 {key} 必须为文本")
         if not isinstance(self.excludes, (tuple, list)):
@@ -49,6 +70,15 @@ class TaskSpec:
         for value in (self.source, self.destination, self.host, self.username, self.identity_file):
             if any(c in value for c in ("\0", "\r", "\n")):
                 raise ValueError("路径和连接信息不能包含换行或空字符")
+        wildcard_source = has_wildcards(self.source)
+        if has_wildcards(self.destination):
+            raise ValueError("目标路径不支持通配符，请填写实际目录")
+        if wildcard_source:
+            pattern = split_wildcard(self.source)[1].rstrip("/")
+            if not pattern or any(not segment for segment in pattern.split("/")):
+                raise ValueError("通配符源路径格式无效，请检查路径分段")
+            if sum(segment == "**" for segment in pattern.split("/")) > MAX_RECURSION_SEGMENTS:
+                raise ValueError(f"递归通配符 ** 最多使用 {MAX_RECURSION_SEGMENTS} 段")
         if type(self.port) is not int or not 1 <= self.port <= 65535:
             raise ValueError("SSH 端口必须是 1–65535 之间的整数")
         if type(self.bandwidth_kib) is not int or self.bandwidth_kib < 0:
@@ -71,16 +101,16 @@ class TaskSpec:
             if self.identity_file and check_paths and not Path(self.identity_file).expanduser().is_file():
                 raise ValueError("SSH 私钥文件不存在")
         if check_paths and self.direction in ("local", "upload"):
-            source = Path(self.source).expanduser()
+            source = Path(split_wildcard(self.source)[0] if wildcard_source else self.source).expanduser()
             if not source.exists() and not source.is_symlink():
-                raise ValueError(f"源文件或目录不存在：{source}")
+                raise ValueError(f"源路径前缀不存在：{source}" if wildcard_source else f"源文件或目录不存在：{source}")
             if self.direction == "local":
                 destination = Path(self.destination).expanduser().resolve()
                 resolved = source.resolve()
-                if self.sync_contents:
-                    # Contents land directly in the destination directory itself.
+                if self.sync_contents or wildcard_source:
+                    # Contents and wildcard matches land in the destination itself.
                     if resolved == destination:
-                        raise ValueError("内容直传需要与源不同的目标目录")
+                        raise ValueError("内容直传或通配符源需要与源不同的目标目录")
                     if source.is_dir() and resolved in destination.parents:
                         raise ValueError("目标目录不能位于源目录内部")
                 else:
@@ -96,9 +126,9 @@ class TaskSpec:
                 raise ValueError("目标路径必须是目录")
         if self.direction == "remote":
             # Paths live on the server; compare them lexically to forbid self-overlap.
-            source_path = PurePosixPath(self.source.rstrip("/") or "/")
+            source_path = PurePosixPath((split_wildcard(self.source)[0] if wildcard_source else self.source).rstrip("/") or "/")
             destination_path = PurePosixPath(self.destination.rstrip("/") or "/")
-            if self.sync_contents:
+            if self.sync_contents or wildcard_source:
                 if source_path == destination_path or source_path in destination_path.parents:
                     raise ValueError("内容直传时目标目录不能与源目录相同或位于其内部")
             elif source_path == destination_path or (source_path.name and source_path == destination_path / source_path.name):

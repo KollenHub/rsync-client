@@ -5,7 +5,7 @@ from dataclasses import replace
 from pathlib import PurePosixPath
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFontDatabase
+from PySide6.QtGui import QColor, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -27,7 +27,14 @@ from PySide6.QtWidgets import (
 )
 
 from .engine import Snapshot, build_command
-from .models import ServerProfile, TaskSpec, connection_route, local_path
+from .glob_expand import build_group_specs, expand_local, expand_remote
+from .models import (
+    ServerProfile,
+    TaskSpec,
+    connection_route,
+    has_wildcards,
+    local_path,
+)
 from .pickers import MixedPicker, RemotePicker
 from .qt_helpers import Modal, button, label, row
 
@@ -200,6 +207,61 @@ class ServerManager(Modal):
         self.app.server_window = None
         if hasattr(self.parentWidget(), 'refresh_endpoints'):
             self.parentWidget().refresh_endpoints()
+
+
+class ExpansionMonitor(Modal):
+    """A plain view over the app's expansion records; closing it loses nothing.
+
+    Records live on the app and are updated by background callbacks, so the
+    window can be closed and reopened at any time with full history intact.
+    """
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.setWindowTitle('解析列表 · 通配符任务')
+        self.resize(880, 420)
+        self.setMinimumSize(640, 300)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.addWidget(label('解析列表', 'title'))
+        layout.addWidget(label('每个通配符模式一行：解析中实时显示已发现项数，完成后任务组自动加入列表；失败会保留原因。', 'muted', wrap=True))
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(['通配符模式', '状态', '详情'])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setColumnWidth(0, 300)
+        self.tree.setColumnWidth(1, 90)
+        layout.addWidget(self.tree, 1)
+        actions = QHBoxLayout()
+        actions.addWidget(button('清除已结束记录', self.clear_finished))
+        actions.addStretch()
+        actions.addWidget(button('关闭', self.accept, primary=True))
+        layout.addLayout(actions)
+        self._rows = {}
+        for record in self.app.expansion_records:
+            self._append(record)
+
+    def _append(self, record):
+        status = {'pending': '解析中', 'done': '完成', 'failed': '失败'}[record['status']]
+        item = QTreeWidgetItem(self.tree, [record['path'], status, record['detail']])
+        if record['status'] != 'pending':
+            item.setForeground(1, QColor('#17866e' if record['status'] == 'done' else '#c24454'))
+        self._rows[record['key']] = item
+
+    def refresh(self):
+        """Rebuild from the records; the app calls this after every update."""
+        self.tree.clear()
+        self._rows.clear()
+        for record in self.app.expansion_records:
+            self._append(record)
+
+    def clear_finished(self):
+        self.app.expansion_records = [r for r in self.app.expansion_records if r['status'] == 'pending']
+        self.refresh()
+
+    def cleanup(self):
+        self.app.expand_window = None
 
 
 class CommandPreview(Modal):
@@ -378,8 +440,12 @@ class TaskDialog(Modal):
     def refresh_sources(self):
         self.source_list.clear()
         self.source_list.addItems(self.sources)
-        mode = '内容直传：源目录的内容直接写入目标目录' if self.contents.isChecked() else \
-            '每个文件或目录独立生成一条任务，保留目录名称'
+        if any(has_wildcards(path) for path in self.sources):
+            mode = '通配符源：保存后解析为任务组，每个匹配一个独立任务，保留相对目录结构'
+        elif self.contents.isChecked():
+            mode = '内容直传：源目录的内容直接写入目标目录'
+        else:
+            mode = '每个文件或目录独立生成一条任务，保留目录名称'
         self.source_count.setText(f'{len(self.sources)} 项 · {mode}')
 
     def add_paths(self, paths):
@@ -423,7 +489,10 @@ class TaskDialog(Modal):
         window.setWindowTitle('输入源路径 · 每行一项')
         window.resize(650, 360)
         box = QVBoxLayout(window)
-        box.addWidget(label('每行填写一个文件或目录的绝对路径。', 'muted'))
+        box.addWidget(label('每行填写一个文件或目录的绝对路径。源路径支持通配符，匹配结果会解析成一组独立任务：\n'
+                            '* 匹配一层内的任意名称，** 单独成段时递归任意层级（含当前层），? 匹配单个字符。\n'
+                            '例如 /data/lvio_task/*/*/Pose 会展开为每个 Pose 目录一条任务，保留相对目录结构。',
+                            'muted', wrap=True))
         text = QPlainTextEdit()
         box.addWidget(text, 1)
 
@@ -433,21 +502,22 @@ class TaskDialog(Modal):
         box.addWidget(button('加入列表', add, primary=True))
         self.app.show_dialog(window)
 
-    def build_specs(self):
+    def build_specs(self, paths=None):
+        paths = self.sources if paths is None else paths
         if not self.sources or not self.destination.text().strip():
             raise ValueError('请选择源文件 / 目录，并指定目标目录')
         if self._source and self._target and self._source != self._target:
             raise ValueError('暂不支持两台不同服务器之间直接同步；请在本机中转，或两端选择同一台服务器')
         if self.editing and len(self.sources) != 1:
             raise ValueError('编辑单条任务时请保留一个源路径；批量传输请新建')
-        names = [PurePosixPath(path).name for path in self.sources]
+        names = [PurePosixPath(path).name for path in paths]
         if len(names) != len(set(names)) and not self.contents.isChecked():
             raise ValueError('同名文件或目录会写入同一目标，请拆分到不同目标目录，或勾选内容直传合并')
         direction = 'remote' if self._source and self._source == self._target else \
             'download' if self._source else 'upload' if self._target else 'local'
         profile = self.app.servers.get(self._source or self._target)
         specs = []
-        for path in self.sources:
+        for path in paths:
             prefix = self.name.text().strip()
             basename = PurePosixPath(path).name or 'root'
             spec = TaskSpec(name=prefix if self.editing else f'{prefix} / {basename}' if prefix else basename,
@@ -471,18 +541,72 @@ class TaskDialog(Modal):
 
     def submit(self):
         try:
-            specs = self.build_specs()
+            wildcard = [path for path in self.sources if has_wildcards(path)]
+            plain = [path for path in self.sources if not has_wildcards(path)]
+            if self.editing and wildcard:
+                raise ValueError('编辑任务不支持通配符路径；请移除后重新新建传输')
+            specs = self.build_specs(plain)
             if self.editing:
                 self.app.manager.update(self.editing.id, specs[0])
             else:
                 for spec in specs:
                     self.app.manager.add(spec)
-            direction = specs[0].direction
+            direction = specs[0].direction if specs else (
+                'remote' if self._source and self._source == self._target else
+                'download' if self._source else 'upload' if self._target else 'local')
             server_id = self._source if direction in ('download', 'remote') else self._target if direction == 'upload' else ''
             source_hint = str(PurePosixPath(self.sources[-1]).parent) if self.sources else ''
             self.app.remember_directories(server_id, direction, source=source_hint, destination=self.destination.text())
             self.app.persist()
-            self.app.show_tasks(specs[0].direction)
+            self.app.show_tasks(direction)
+            if wildcard:
+                for path in wildcard:
+                    self._expand_path(path)
             self.accept()
         except (ValueError, OSError) as exc:
             QMessageBox.critical(self, '无法保存任务', str(exc))
+
+    def _expand_path(self, path):
+        """Track one wildcard expansion in the app records; results join the task list."""
+        direction = 'remote' if self._source and self._source == self._target else \
+            'download' if self._source else 'upload' if self._target else 'local'
+        destination = self.destination.text().strip()
+        prefix = self.name.text().strip()
+        group_name = prefix or PurePosixPath(path.rstrip('/')).name or '通配符任务'
+        options = {'direction': direction, 'compression': self.compression.isChecked(),
+                   'bandwidth_kib': self.bandwidth.value(),
+                   'excludes': tuple(rule.strip() for rule in self.excludes.text().split(';') if rule.strip()),
+                   'group_name': group_name}
+        profile, jumps = None, ()
+        if direction in ('download', 'remote'):
+            route = self.app.resolve_server(self._source, self)
+            if not route:
+                self.app.expansion_finish(self.app.add_expansion(path), False, '无法解锁服务器凭据，解析未开始')
+                return
+            profile, jumps = route[-1], route[:-1]
+            service = self.app.remote
+
+            def work(publish):
+                return expand_remote(profile, path, service, jumps, on_progress=publish)
+        else:
+
+            def work(publish):
+                return expand_local(path, on_progress=publish)
+        key = self.app.add_expansion(path)
+
+        def on_progress(payload):
+            self.app.expansion_progress(key, *payload)
+
+        def done(result, error):
+            if error:
+                self.app.expansion_finish(key, False, error)
+                return
+            specs = build_group_specs(result, destination, local=direction in ('local', 'upload'), **options)
+            for spec in specs:
+                final = replace(profile.bind(spec), jump_hosts=jumps) if profile else spec
+                self.app.manager.add(final)
+            self.app.persist()
+            self.app.refresh()
+            self.app.expansion_finish(key, True, f'已加入 {len(specs)} 个任务（组：{group_name}）')
+
+        self.app.background(work, done, on_progress=on_progress)

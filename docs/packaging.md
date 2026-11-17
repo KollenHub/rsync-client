@@ -16,8 +16,8 @@ Qt 使用 `PySide6-Essentials 6.8.3` 的 manylinux_2_28 wheel，兼容 glibc 2.3
 
 产物位于 `dist/`：
 
-- `rsync-desk_1.0.1-1ubuntu20.04_amd64.deb`：安装包，依赖由 apt 处理。
-- `rsync-desk-1.0.1-ubuntu20.04-x86_64.tar.gz`：便携目录压缩包，完整解压后运行 `rsync-desk`。
+- `rsync-desk_1.1.0-1ubuntu20.04_amd64.deb`：安装包，依赖由 apt 处理。
+- `rsync-desk-1.1.0-ubuntu20.04-x86_64.tar.gz`：便携目录压缩包，完整解压后运行 `rsync-desk`。
 - 同名 `build-info.json`：构建版本、Qt 模块/插件、glibc 审计和冒烟测试结果。
 - `SHA256SUMS`：安装包与压缩包校验值。
 
@@ -26,7 +26,7 @@ Python 和应用依赖包含在发布目录内，运行时不需要 Python。rsy
 ## 安装与使用
 
 ```bash
-sudo apt install ./rsync-desk_1.0.1-1ubuntu20.04_amd64.deb
+sudo apt install ./rsync-desk_1.1.0-1ubuntu20.04_amd64.deb
 rsync-desk
 ```
 

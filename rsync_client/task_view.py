@@ -28,5 +28,10 @@ class TaskFilter(QSortFilterProxyModel):
         self.invalidate()
 
     def filterAcceptsRow(self, source_row, source_parent):
-        task = self.sourceModel().tasks[source_row]
+        model = self.sourceModel()
+        kind, _key, members = model.display[source_row]
+        if kind == 'group':
+            status = model._group_status(members)
+            return members[0].spec.direction == self.direction and (self.status == 'all' or task_group(status) == self.status)
+        task = members[0]
         return task.spec.direction == self.direction and (self.status == 'all' or task_group(task.status) == self.status)

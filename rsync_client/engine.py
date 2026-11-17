@@ -17,12 +17,45 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 
 from .askpass import PasswordBroker
-from .models import ACTIVE, ServerProfile, TaskSpec, local_path
+from .models import (
+    ACTIVE,
+    ServerProfile,
+    TaskSpec,
+    has_wildcards,
+    local_path,
+    split_wildcard,
+)
 
 PROGRESS = re.compile(r"^\s*([\d,]+)\s+(\d+)%\s+([\d.]+)([kKMGT]?B)/s\s+(\S+)")
 TOTAL = re.compile(r"^Total transferred file size:\s*([\d,]+)")
 REMOTE_PID = re.compile(r"^RSYNC_PID=(\d+)$")
 FILE_MARKER = "@@RSYNC_FILE@@"
+SCAN_HEARTBEAT_SECONDS = 30.0  # silent-scan heartbeat; module-level so tests can lower it
+
+
+def wildcard_filters(pattern: str) -> list[str]:
+    """Translate a wildcard pattern (relative to its literal prefix) into rsync filters.
+
+    `*` matches one path segment, `?` a single character, and a standalone `**`
+    any number of segments. rsync's `**` requires at least one segment, so every
+    `**` expands into a zero-level variant plus a recursive variant. Each variant
+    emits two rules: the name match itself (files and directories alike) and
+    `/***` for the contents of matching directories.
+    """
+    segments = [segment for segment in pattern.split("/") if segment]
+    recursive = [i for i, segment in enumerate(segments) if segment == "**"]
+    variants: list[str] = []
+    for mask in range(1 << len(recursive)):
+        dropped = {recursive[bit] for bit in range(len(recursive)) if mask >> bit & 1}
+        variant = "/".join(segment for i, segment in enumerate(segments) if i not in dropped)
+        if variant and variant not in variants:
+            variants.append(variant)
+    args = ["--include=*/"]  # let rsync descend through every directory
+    for variant in variants:
+        args.extend((f"--include=/{variant}", f"--include=/{variant}/***"))
+    if not variants:  # the pattern was a bare '**': keep everything below the prefix
+        args.append("--include=/**")
+    return args + ["--exclude=*"]
 
 
 def _ssh_options(profile: ServerProfile | TaskSpec) -> list[str]:
@@ -62,20 +95,28 @@ def build_command(spec: TaskSpec, *, dry_run: bool = False, rsync: str = "rsync"
     # -rlt preserves links and timestamps without requiring ownership/device privileges.
     command = [rsync, "-rlt", "-s", "--8-bit-output", "--no-human-readable", "--stats", "--outbuf=L"]
     if dry_run:
-        command.append("--dry-run")
+        # -v streams every match as the scan finds it, giving visible progress
+        # instead of silence until the final --stats summary.
+        command.extend(["-v", "--dry-run", f"--out-format={FILE_MARKER}%n"])
     else:
         command.extend(["--partial-dir=.rsync-partial", "--info=progress2", f"--out-format={FILE_MARKER}%n"])
     if spec.bandwidth_kib:
         command.append(f"--bwlimit={spec.bandwidth_kib}")
     for pattern in spec.excludes:
         command.extend(["--exclude", pattern])
-    source = spec.source.rstrip("/") or "/"
+    # Wildcard sources transfer the literal prefix's contents; filter rules pick
+    # the matches. User excludes stay first so they keep priority over includes.
+    wildcard = has_wildcards(spec.source)
+    if wildcard:
+        command.append("-m")
+        command.extend(wildcard_filters(split_wildcard(spec.source)[1]))
+    source = (split_wildcard(spec.source)[0] if wildcard else spec.source).rstrip("/") or "/"
     destination = spec.destination.rstrip("/") + "/"
     # A trailing slash makes rsync copy the directory's contents instead of the
     # directory itself. local_path() below normalizes away trailing slashes, so
     # the suffix must be appended afterwards.
-    contents = spec.sync_contents and (spec.direction in ("remote", "download")
-                                       or Path(local_path(spec.source)).is_dir())
+    contents = wildcard or (spec.sync_contents and (spec.direction in ("remote", "download")
+                                                    or Path(local_path(spec.source)).is_dir()))
     suffix = "/" if contents else ""
     if spec.compression and spec.direction != "local":
         command.append("-z")
@@ -114,6 +155,7 @@ class Snapshot:
     return_code: int | None
     started_at: float | None
     ended_at: float | None
+    scanned_files: int = 0
 
     @property
     def percent(self) -> float:
@@ -150,6 +192,7 @@ class _Task:
     logs: deque = field(default_factory=lambda: deque(maxlen=10_000))
     sequence: int = 0
     remote_pid: int = 0  # server-side rsync process, for remote-internal cancellations
+    scanned_files: int = 0  # matches streamed by the dry-run scan
 
     def snapshot(self) -> Snapshot:
         fields = Snapshot.__dataclass_fields__
@@ -267,8 +310,8 @@ class TaskManager:
             return [(n, text) for n, text in task.logs if n > sequence] if task else []
 
     def set_concurrency(self, count: int) -> None:
-        if not 1 <= count <= 8:
-            raise ValueError("并发数必须是 1–8")
+        if not 1 <= count <= 16:
+            raise ValueError("并发数必须是 1–16")
         with self._lock:
             self._concurrency = count
             self._launch()
@@ -295,6 +338,7 @@ class TaskManager:
         task.speed = 0
         task.eta = "—"
         task.current_file = task.error = ""
+        task.scanned_files = 0
         task.return_code = None
         task.started_at = task.ended_at = None
 
@@ -313,8 +357,10 @@ class TaskManager:
     def _target(spec: TaskSpec) -> tuple:
         remote = spec.direction in ("upload", "remote")
         destination = spec.destination if remote else local_path(spec.destination)
-        # Contents mode writes into the destination itself, so such tasks serialize together.
-        target = destination if spec.sync_contents else str(PurePosixPath(destination) / PurePosixPath(spec.source).name)
+        # Contents mode and wildcard matches write into the destination itself,
+        # so such tasks serialize together.
+        target = destination if spec.sync_contents or has_wildcards(spec.source) else \
+            str(PurePosixPath(destination) / PurePosixPath(spec.source).name)
         return (spec.host if remote else "", spec.port if remote else 0,
                 spec.username if remote else "", target)
 
@@ -358,7 +404,12 @@ class TaskManager:
                 task.speed = float(match[3]) * factor
                 task.eta = match[5]
             elif line.startswith(FILE_MARKER):
-                task.current_file = line[len(FILE_MARKER):]
+                name = line[len(FILE_MARKER):]
+                if scanning:  # dry-run: each streamed match is scan progress
+                    task.scanned_files += 1
+                    task.current_file = f"已发现 {task.scanned_files} 项 · {name}"
+                else:
+                    task.current_file = name
 
     @staticmethod
     def _stage_error(spec: TaskSpec, code: int, *, scanning: bool) -> str:
@@ -488,9 +539,11 @@ class TaskManager:
         pending = ""
         terminated_at = None
         killed = False
+        last_activity = time.monotonic()
 
         def consume(text: str, final: bool = False) -> None:
-            nonlocal pending
+            nonlocal pending, last_activity
+            last_activity = time.monotonic()
             pieces = re.split(r"[\r\n]", pending + text)
             pending = pieces.pop()
             for line in pieces:
@@ -522,6 +575,17 @@ class TaskManager:
                             consume(decoder.decode(chunk))
                         else:
                             selector.unregister(key.fileobj)
+                    if dry_run and not task.cancel.is_set() and process.poll() is None:
+                        moment = time.monotonic()
+                        if moment - last_activity >= SCAN_HEARTBEAT_SECONDS:
+                            # started_at is a wall-clock stamp (see _launch); never
+                            # subtract it from the monotonic clock.
+                            elapsed = int(time.time() - (task.started_at or time.time()))
+                            self._log(task, f"仍在扫描…… 已持续 {elapsed} 秒，远端正在遍历目录构建文件列表")
+                            if not task.scanned_files:
+                                with self._lock:
+                                    task.current_file = f"扫描中 · 已等待 {elapsed} 秒"
+                            last_activity = moment
             consume(decoder.decode(b"", final=True), final=True)
             result = process.wait()
             with self._lock:

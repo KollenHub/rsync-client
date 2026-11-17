@@ -10,6 +10,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from rsync_client import engine
 from rsync_client.engine import TaskManager, build_command, summarize
 from rsync_client.models import TaskSpec
 
@@ -127,6 +128,63 @@ class TransferTests(unittest.TestCase):
         for key in keys:
             self.wait_for(key, {"cancelled"})
 
+    def test_wildcard_source_transfers_matching_tree(self):
+        root = self.root / "lvio"
+        for folder in (root / "Pose", root / "t1" / "Pose", root / "t1" / "deep" / "t2"):
+            folder.mkdir(parents=True)
+        (root / "Pose" / "f0").write_text("0")
+        (root / "t1" / "Pose" / "f1").write_text("1")
+        (root / "t1" / "deep" / "t2" / "Pose").write_text("2")  # a file named Pose
+        (root / "t1" / "skip.txt").write_text("skip")
+        out = self.root / "out"
+        spec = TaskSpec("通配", str(root) + "/**/Pose", str(out))
+        command = build_command(spec)
+        self.assertEqual(command[-2], str(root) + "/")
+        key = self.manager.add(spec)
+        self.manager.start([key])
+        result = self.wait_for(key, {"success", "failed"})
+        self.assertEqual(result.status, "success", result.error)
+        self.assertTrue((out / "Pose" / "f0").exists())
+        self.assertTrue((out / "t1" / "Pose" / "f1").exists())
+        self.assertTrue((out / "t1" / "deep" / "t2" / "Pose").exists())
+        self.assertFalse((out / "t1" / "skip.txt").exists())
+
+    def test_wildcard_source_matches_files_by_name(self):
+        root = self.root / "logs"
+        (root / "a").mkdir(parents=True)
+        (root / "a" / "x.info").write_text("x")
+        (root / "a" / "y.txt").write_text("y")
+        out = self.root / "out2"
+        key = self.manager.add(TaskSpec("文件名", str(root) + "/**/*.info", str(out)))
+        self.manager.start([key])
+        result = self.wait_for(key, {"success", "failed"})
+        self.assertEqual(result.status, "success", result.error)
+        self.assertTrue((out / "a" / "x.info").exists())
+        self.assertFalse((out / "a" / "y.txt").exists())
+
+    def test_scan_heartbeat_logs_while_silent(self):
+        source = self.root / "source"
+        source.touch()
+        fake = self.root / "slow-rsync"
+        fake.write_text("#!/usr/bin/env python3\nimport sys, time\ntime.sleep(0.7)\n"
+                        "if '--dry-run' in sys.argv:\n print('Total transferred file size: 1024 bytes')\n")
+        fake.chmod(0o700)
+        self.manager.rsync = str(fake)
+        previous = engine.SCAN_HEARTBEAT_SECONDS
+        engine.SCAN_HEARTBEAT_SECONDS = 0.2
+        try:
+            key = self.manager.add(TaskSpec("slow", str(source), str(self.root / "out")))
+            self.manager.start([key])
+            result = self.wait_for(key, {"success", "failed"})
+            self.assertEqual(result.status, "success", result.error)
+            logs = "\n".join(text for _, text in self.manager.logs_since(key, 0))
+            self.assertIn("仍在扫描", logs)
+            beat = next(line for line in logs.splitlines() if "仍在扫描" in line)
+            elapsed = int(beat.split("已持续 ")[1].split(" 秒")[0])
+            self.assertGreaterEqual(elapsed, 0)
+        finally:
+            engine.SCAN_HEARTBEAT_SECONDS = previous
+
     def test_nonzero_exit_is_failure_and_password_is_redacted(self):
         source = self.root / "source"
         source.touch()
@@ -219,6 +277,69 @@ class CommandTests(unittest.TestCase):
         upload = TaskSpec("u", "/tmp/x", "/b", direction="upload", host="s", username="u")
         self.assertIn("退出码 12", TaskManager._stage_error(upload, 12, scanning=False))
         self.assertIn("可能是远端服务器未安装", TaskManager._stage_error(upload, 12, scanning=False))
+
+    def test_wildcard_source_expands_into_filter_rules(self):
+        spec = TaskSpec("wild", "/data/lvio_task/**/Pose", "/backup/pose", direction="download",
+                        host="server.example", username="alice", excludes=(".git",))
+        spec.validate(check_paths=False)
+        command = build_command(spec)
+        self.assertIn("-m", command)
+        for rule in ("--include=*/", "--include=/Pose", "--include=/Pose/***",
+                     "--include=/**/Pose", "--include=/**/Pose/***", "--exclude=*"):
+            self.assertIn(rule, command)
+        # user excludes keep priority over the generated traversal rule
+        self.assertLess(command.index(".git"), command.index("--include=*/"))
+        tail = command[command.index("--") + 1:]
+        self.assertEqual(tail, ["server.example:/data/lvio_task/", "/backup/pose/"])
+
+    def test_wildcard_name_and_single_level_patterns(self):
+        spec = TaskSpec("name", "/data/*/*.info", "/backup/files", direction="remote",
+                        host="server.example", username="alice")
+        spec.validate(check_paths=False)
+        remote_rsync = shlex.split(build_command(spec)[-1].split("; exec ", 1)[1])
+        self.assertIn("--include=/*/*.info", remote_rsync)
+        self.assertIn("--include=/*/*.info/***", remote_rsync)
+        self.assertEqual(remote_rsync[-2:], ["/data/", "/backup/files/"])
+
+    def test_wildcard_validation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "lvio"
+            (root / "t1").mkdir(parents=True)
+            TaskSpec("ok", str(root) + "/**/Pose", str(Path(td) / "out")).validate()
+            TaskSpec("ok-file", str(root) + "/**/*.info", str(Path(td) / "out")).validate()
+            with self.assertRaises(ValueError):  # literal prefix must exist
+                TaskSpec("bad", str(Path(td) / "missing") + "/**/Pose", str(Path(td) / "out")).validate()
+            with self.assertRaises(ValueError):  # destination cannot contain wildcards
+                TaskSpec("bad", str(root) + "/**/Pose", str(Path(td) / "out/*")).validate()
+            for destination in (root, root / "nested"):  # wildcard source behaves like contents mode
+                with self.subTest(destination=destination), self.assertRaises(ValueError):
+                    TaskSpec("bad", str(root) + "/**/Pose", str(destination)).validate()
+        with self.assertRaises(ValueError):  # too many recursive segments
+            TaskSpec("bad", "/a/**/**/**/**/**/Pose", "/backup").validate(check_paths=False)
+        with self.assertRaises(ValueError):  # empty path segment
+            TaskSpec("bad", "/a/**//Pose", "/backup").validate(check_paths=False)
+        with self.assertRaises(ValueError):  # remote-internal wildcard overlap
+            TaskSpec("bad", "/srv/data/**/Pose", "/srv/data", direction="remote",
+                     host="s", username="u").validate(check_paths=False)
+        TaskSpec("ok", "/srv/data/**/Pose", "/srv/backup", direction="remote",
+                 host="s", username="u").validate(check_paths=False)
+
+    def test_scan_streams_found_items_as_progress(self):
+        spec = TaskSpec("s", "/tmp/x", "/tmp/out")
+        spec.validate(check_paths=False)
+        manager = TaskManager()
+        task = engine._Task(spec)
+        for name in ("a/Pose/x.info", "b.info"):
+            TaskManager._parse(manager, task, engine.FILE_MARKER + name, True)
+        self.assertEqual(task.scanned_files, 2)
+        self.assertEqual(task.snapshot().scanned_files, 2)
+        self.assertIn("已发现 2 项", task.current_file)
+        TaskManager._parse(manager, task, engine.FILE_MARKER + "c.info", False)
+        self.assertEqual(task.current_file, "c.info")
+        dry = build_command(spec, dry_run=True)
+        self.assertIn("-v", dry)
+        self.assertIn("--out-format=@@RSYNC_FILE@@%n", dry)
+        manager.shutdown()
 
     def test_sync_contents_rejects_same_or_nested_destination(self):
         with tempfile.TemporaryDirectory() as td:
