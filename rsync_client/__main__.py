@@ -61,7 +61,7 @@ def main() -> int:
     _activate_input_method()
     from . import __version__
     parser = argparse.ArgumentParser(description='Rsync Desk · Python 桌面文件同步客户端')
-    parser.add_argument('--config', type=Path, help='指定配置文件（密码库存放于同目录）')
+    parser.add_argument('--config', type=Path, help='指定配置数据库文件（密码库存于同一数据库）')
     parser.add_argument('--version', action='version', version=f'Rsync Desk {__version__}')
     parser.add_argument('--self-test', action='store_true', help='检查界面、同步、密码库及编译后密码助手')
     args = parser.parse_args()

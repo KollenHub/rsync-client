@@ -42,7 +42,7 @@ def run() -> int:
                 raise RuntimeError(f'同步检查失败：{task.error}')
         finally:
             manager.shutdown()
-        vault = Vault(root / 'credentials.enc')
+        vault = Vault(root / 'rsync-desk.db')
         vault.unlock('temporary-master-password')
         reference = vault.put('temporary-ssh-password')
         vault.lock()
@@ -58,7 +58,7 @@ def run() -> int:
         application = QApplication.instance() or QApplication([])
         application.setQuitOnLastWindowClosed(False)
         setup_style(application)
-        window = App(root / 'tasks.json')
+        window = App(root / 'rsync-desk.db')
         window.show()
         history_id = window.manager.add(spec)
         window.manager.restore(history_id, {'status': 'success', 'total_bytes': source.stat().st_size,

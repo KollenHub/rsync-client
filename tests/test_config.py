@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -44,7 +45,7 @@ class ServerConfigTests(unittest.TestCase):
             manager.restore(key, {'status': 'failed', 'error': 'private-password denied', 'total_bytes': 10, 'transferred_bytes': 4, 'return_code': 23})
             snapshot = manager.get(key)
             save_config(path, [spec], 2, [], states=[snapshot.public_state()])
-            self.assertNotIn('private-password', path.read_text())
+            self.assertNotIn('private-password', path.read_bytes().decode('utf-8', errors='replace'))
             restored = load_task_states(path)[0]
             self.assertEqual(restored['status'], 'failed')
             self.assertEqual(restored['return_code'], 23)
@@ -78,10 +79,10 @@ class ServerConfigTests(unittest.TestCase):
             self.assertEqual(servers[0].credential_id, "old-vault-reference")
             self.assertTrue(all(s.server_id == servers[0].id for s in specs))
             save_config(path, specs, concurrency, servers)
-            data = json.loads(path.read_text())
-            self.assertEqual(data["version"], 2)
-            self.assertNotIn("host", data["tasks"][0])
-            self.assertNotIn("credential_id", data["tasks"][0])
+            # Server-bound tasks keep no connection fields of their own in the tasks table.
+            with sqlite3.connect(path) as connection:
+                self.assertEqual(connection.execute("SELECT host, username, credential_id FROM tasks").fetchall(),
+                                 [('', '', '')] * 2)
             restored, _, profiles, _ = load_config(path)
             self.assertEqual(restored[0].username, first.username)
             self.assertEqual(profiles[0].port, 2222)
@@ -94,7 +95,7 @@ class ServerConfigTests(unittest.TestCase):
             task = target.bind(TaskSpec("download", "/data", "/local", direction="download"))
             target = replace(target, host="new-target.example", port=2222)
             save_config(path, [task], 2, [jump, target])
-            raw = path.read_text()
+            raw = path.read_bytes().decode('utf-8', errors='replace')
             for secret in (jump.password, target.password):
                 self.assertNotIn(secret, raw)
             specs, _, profiles, _ = load_config(path)

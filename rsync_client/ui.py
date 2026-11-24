@@ -276,7 +276,7 @@ class App(QMainWindow):
         self.resize(1320, 860)
         self.setMinimumSize(1080, 720)
         self.config_path = config_path or default_config_path()
-        self.vault = Vault(self.config_path.parent / 'credentials.enc')
+        self.vault = Vault(self.config_path)
         self.remote = RemoteService()
         self.details = {}
         self.server_window = None
@@ -607,7 +607,7 @@ class App(QMainWindow):
     def unlock_vault(self, parent=None):
         if self.vault.unlocked:
             return True
-        existing = self.vault.path.exists()
+        existing = self.vault.exists
         prompt = '输入主密码以解锁已保存的 SSH 密码。' if existing else '设置密码库主密码（至少 8 位），请妥善记住。'
         password, ok = QInputDialog.getText(parent or self, '解锁密码库' if existing else '创建密码库', prompt, QLineEdit.EchoMode.Password)
         if not ok:

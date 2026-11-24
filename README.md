@@ -96,26 +96,25 @@ rsync-desk
 
 ## 账号密码保存
 
-旧版任务配置在读取时自动迁移：连接信息归入服务器列表，任务引用对应服务器，保留原密码库引用。
+所有配置数据保存在单一 SQLite 数据库中，首次启动时自动迁移旧版文件：`tasks.json` 的连接信息归入服务器列表、任务引用对应服务器并保留原密码库引用，`credentials.enc` 密码库整体导入；导入成功后旧文件改名为 `tasks.json.migrated` / `credentials.enc.migrated` 留作手动备份。
 
 默认配置目录：`~/.config/rsync-desk/`，也遵循 `XDG_CONFIG_HOME`。
 
 | 文件 | 内容 |
 | --- | --- |
-| `tasks.json` | 独立的服务器列表（账号、端口、跳板机、密码引用）和引用服务器的任务列表、任务状态与最终统计，不含明文密码 |
-| `credentials.enc` | AES-256-GCM 加密密码库，PBKDF2-HMAC-SHA256（600,000 次）派生密钥 |
+| `rsync-desk.db` | SQLite 数据库：服务器列表（账号、端口、跳板机、密码引用）、任务及状态与最终统计、目录记忆，以及 AES-256-GCM 加密密码库（PBKDF2-HMAC-SHA256，600,000 次派生密钥） |
 
-配置和密码库以 `0600` 权限原子写入。主密码不写入磁盘；应用退出时清除解锁状态。主密码无法找回，建议备份上述两个文件并妥善保存主密码。服务器中取消“加密保存密码”会解绑该服务器的密码引用，已存在的密码库条目不会自动删除。
+数据库以 `0600` 权限原子写入。主密码不写入磁盘；应用退出时清除解锁状态。主密码无法找回，建议备份数据库文件并妥善保存主密码。服务器中取消“加密保存密码”会解绑该服务器的密码引用，已存在的密码库条目不会自动删除。
 
 rsync 的 SSH 登录通过私有 Unix socket 和 `SSH_ASKPASS` 按连接身份提供各跳密码，不放入命令行、环境变量或临时文件内容。日志会遮盖当前密码。首次连接采用 `StrictHostKeyChecking=accept-new`，主机密钥记录到 OpenSSH 的 `known_hosts`，之后密钥变化会拒绝连接。
 
 需要其他配置位置时：
 
 ```bash
-python -m rsync_client --config /path/to/config/tasks.json
+python -m rsync_client --config /path/to/config/rsync-desk.db
 ```
 
-密码库保存在指定配置文件同目录。使用带密码的私钥时，请先用 `ssh-add` 加入 SSH agent；当前密码框用于远端登录密码。
+密码库保存在指定的配置数据库内。使用带密码的私钥时，请先用 `ssh-add` 加入 SSH agent；当前密码框用于远端登录密码。
 
 ## 界面与打包约定
 

@@ -35,7 +35,7 @@ class GuiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.app = App(self.root / 'config' / 'tasks.json')
+        self.app = App(self.root / 'config' / 'rsync-desk.db')
         self.app.show()
         self.qt.processEvents()
 
@@ -272,7 +272,7 @@ class GuiTests(unittest.TestCase):
         self.assertFalse(hasattr(dialog, 'password'))
         dialog.submit()
         config = self.app.config_path
-        self.assertNotIn('saved-password', config.read_text())
+        self.assertNotIn('saved-password', config.read_bytes().decode('utf-8', errors='replace'))
         self.app.close()
         self.app.deleteLater()
         self.qt.processEvents()

@@ -11,17 +11,23 @@ from pathlib import Path
 from rsync_client.askpass import PasswordBroker
 from rsync_client.config import load_tasks, save_tasks
 from rsync_client.models import TaskSpec
+from rsync_client.storage import Store
 from rsync_client.vault import Vault
+
+
+def vault_json(path: Path) -> dict:
+    """Decoded vault blob as stored inside the SQLite database."""
+    return json.loads(Store(path).vault_blob())
 
 
 class CredentialTests(unittest.TestCase):
     def test_encrypted_password_survives_restart_and_wrong_key_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "credentials.enc"
+            path = Path(td) / "rsync-desk.db"
             first = Vault(path)
             first.unlock("my master password")
             reference = first.put("远端密码-p@ssword")
-            raw = path.read_text()
+            raw = path.read_bytes().decode("utf-8", errors="replace")
             self.assertNotIn("p@ssword", raw)
             self.assertNotIn("my master password", raw)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -34,24 +40,24 @@ class CredentialTests(unittest.TestCase):
             self.assertFalse(second.unlocked)
             second.unlock("my master password")
             self.assertEqual(second.get(reference), "远端密码-p@ssword")
-            before = json.loads(raw)["nonce"]
+            before = vault_json(path)["nonce"]
             second.put("updated", reference)
-            self.assertNotEqual(before, json.loads(path.read_text())["nonce"])
+            self.assertNotEqual(before, vault_json(path)["nonce"])
             third = Vault(path)
             third.unlock("my master password")
             self.assertEqual(third.get(reference), "updated")
 
     def test_tampering_is_detected(self):
         with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "credentials.enc"
+            path = Path(td) / "rsync-desk.db"
             vault = Vault(path)
             vault.unlock("master password")
             vault.put("ssh password")
-            data = json.loads(path.read_text())
+            data = vault_json(path)
             encrypted = bytearray(base64.b64decode(data["ciphertext"]))
             encrypted[0] ^= 1
             data["ciphertext"] = base64.b64encode(encrypted).decode()
-            path.write_text(json.dumps(data))
+            Store(path).write_vault(json.dumps(data))
             with self.assertRaises(ValueError):
                 Vault(path).unlock("master password")
 
@@ -61,7 +67,7 @@ class CredentialTests(unittest.TestCase):
             spec = TaskSpec("saved", "/src", "/dst", direction="upload", host="server.example",
                             username="alice", port=2222, password="private-password", credential_id="ref")
             save_tasks(path, [spec], 3)
-            self.assertNotIn("private-password", path.read_text())
+            self.assertNotIn("private-password", path.read_bytes().decode("utf-8", errors="replace"))
             specs, count = load_tasks(path)
             self.assertEqual(count, 3)
             self.assertEqual(specs[0].credential_id, "ref")
