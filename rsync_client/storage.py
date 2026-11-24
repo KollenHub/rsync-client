@@ -3,7 +3,9 @@
 Everything the application persists lives in a single database file. Legacy
 installations kept ``tasks.json`` plus ``credentials.enc`` next to it; the first
 time a fresh database is created those files are imported automatically and
-renamed to ``*.migrated`` so they stay available as a manual backup.
+renamed to ``*.migrated`` so they stay available as a manual backup. A legacy
+file that cannot be parsed is sidelined as ``*.invalid`` instead of blocking
+the database, so saving keeps working.
 """
 from __future__ import annotations
 
@@ -120,8 +122,8 @@ def sanitize_last_directories(raw) -> dict[str, dict[str, dict[str, str]]]:
 
 
 def _validate_concurrency(value) -> int:
-    if type(value) is not int or not 1 <= value <= 8:
-        raise ValueError("并发任务数必须是 1–8")
+    if type(value) is not int or not 1 <= value <= 16:
+        raise ValueError("并发任务数必须是 1–16")
     return value
 
 
@@ -154,11 +156,14 @@ def _assemble(items: list[dict], servers: list[ServerProfile]) -> list[TaskSpec]
     return specs
 
 
-def _parse_legacy(data) -> tuple[list[TaskSpec], int, list[ServerProfile], dict, list[dict]]:
+def _parse_legacy(data) -> tuple[list[TaskSpec], int, list[ServerProfile], list[dict], dict]:
     """Validate a legacy tasks.json document and return its normalized contents."""
     if not isinstance(data, dict) or data.get("version") not in (1, 2) or not isinstance(data.get("tasks"), list):
         raise ValueError("无法识别的任务配置格式")
-    concurrency = _validate_concurrency(data.get("concurrency", 2))
+    concurrency = data.get("concurrency", 2)
+    if type(concurrency) is not int:
+        concurrency = 2
+    concurrency = min(max(concurrency, 1), 16)  # clamp; old UIs allowed values the legacy loader rejected
     if data["version"] == 1:
         specs, servers = migrate_connections([TaskSpec.from_dict(item) for item in data["tasks"]])
         return specs, concurrency, servers, [{} for _ in specs], {}
@@ -214,8 +219,12 @@ class Store:
         if not header:
             self.path.unlink(missing_ok=True)  # empty placeholder from an aborted run
             return
-        payload = _read_legacy_tasks(self.path)
-        os.replace(self.path, _backup_name(self.path))
+        try:
+            payload = _read_legacy_tasks(self.path)
+            suffix = ".migrated"
+        except (ValueError, TypeError, KeyError):
+            payload, suffix = None, ".invalid"  # keep the foreign file aside; create a fresh database
+        os.replace(self.path, _backup_name(self.path, suffix))
         self._pending = payload
 
     def _prepare(self, connection: sqlite3.Connection) -> None:
@@ -233,24 +242,31 @@ class Store:
         else:
             candidate = self.path.parent / "tasks.json"
             if candidate.exists() and candidate.stat().st_size:
-                legacy, legacy_file = _read_legacy_tasks(candidate), candidate
+                try:
+                    legacy, legacy_file = _read_legacy_tasks(candidate), candidate
+                except (OSError, ValueError, TypeError, KeyError):
+                    os.replace(candidate, _backup_name(candidate, ".invalid"))
         credentials = self.path.parent / "credentials.enc"
         try:
             blob = credentials.read_text(encoding="utf-8") if credentials.exists() and credentials.stat().st_size else None
         except (OSError, UnicodeDecodeError):
             blob = None  # keep the unreadable file in place for manual recovery
         connection.executescript(_SCHEMA)
-        if legacy is not None or blob is not None:
+        if legacy is not None:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                if legacy is not None:
-                    self._write(connection, *legacy)
-                if blob is not None:
-                    connection.execute("INSERT OR REPLACE INTO vault (id, blob) VALUES (1, ?)", (blob,))
-            except BaseException:
+                self._write(connection, *legacy)
+                connection.commit()
+            except (sqlite3.Error, ValueError, TypeError):
+                connection.rollback()  # database stays usable; the original file is kept
+                legacy_file = None
+        if blob is not None:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("INSERT OR REPLACE INTO vault (id, blob) VALUES (1, ?)", (blob,))
+                connection.commit()
+            except sqlite3.Error:
                 connection.rollback()
-                raise
-            connection.commit()
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         try:
             os.chmod(self.path, 0o600)
@@ -348,7 +364,7 @@ class Store:
         try:
             concurrency = _validate_concurrency(int(row[0])) if row else 2
         except (TypeError, ValueError) as exc:
-            raise ValueError("并发任务数必须是 1–8") from exc
+            raise ValueError("并发任务数必须是 1–16") from exc
         servers = [ServerProfile.from_dict(dict(zip(_SERVER_COLUMNS, row))) for row in server_rows]
         items = [_task_item(row) for row in task_rows]
         directories: dict[str, dict[str, dict[str, str]]] = {}
@@ -383,5 +399,5 @@ def _task_item(row) -> dict:
     return item
 
 
-def _backup_name(path: Path) -> Path:
-    return path.with_name(path.name + ".migrated")
+def _backup_name(path: Path, suffix: str = ".migrated") -> Path:
+    return path.with_name(path.name + suffix)

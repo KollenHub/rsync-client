@@ -32,10 +32,6 @@ class Vault:
         """True once a vault blob is stored; drives create-versus-unlock prompts."""
         return self.store.vault_blob() is not None
 
-    @property
-    def unlocked(self) -> bool:
-        return self._key is not None
-
     def unlock(self, master_password: str) -> None:
         try:
             from cryptography.exceptions import InvalidTag

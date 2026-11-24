@@ -105,6 +105,12 @@ class ServerConfigTests(unittest.TestCase):
             self.assertEqual(specs[0].jump_hosts[0].credential_id, "jump-ref")
             self.assertTrue(all(not p.password for p in profiles))
 
+    def test_concurrency_upper_bound_matches_engine_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'rsync-desk.db'
+            save_config(path, [], 16, [])
+            self.assertEqual(load_config(path)[1], 16)
+
     def test_reject_missing_hop_and_cycles(self):
         first = ServerProfile("first", "one.example", "alice")
         second = ServerProfile("second", "two.example", "alice", jump_server_id=first.id)
